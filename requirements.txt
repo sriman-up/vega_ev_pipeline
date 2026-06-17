@@ -1,0 +1,17 @@
+# Core
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+pdfplumber>=0.10.3
+numpy>=1.26.0
+psycopg2-binary>=2.9.9
+
+# Scheduling
+APScheduler>=3.10.4
+
+# Optional: Selenium fallback for JS-heavy pages
+# selenium>=4.18.1
+# webdriver-manager>=4.0.1
+
+# Dev / notebook
+pandas>=2.2.0        # useful for exploratory analysis
+scikit-learn>=1.4.0  # for model training

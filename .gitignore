@@ -1,0 +1,5 @@
+/TS_LT_data
+/pdfs
+*.zip
+.env
+.claude/

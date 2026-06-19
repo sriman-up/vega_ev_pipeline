@@ -72,6 +72,19 @@ ev_pipeline/
 ├── utils/
 │ ├── **init**.py
 │ └── helpers.py # Type coercions, retry decorator, cache, date utils
-├── pipeline.py # Orchestrator: seed / monthly / enrich / features modes
+├── pipeline.py # Orchestrator: seed / monthly / enrich / features / spatial / backfill modes
 ├── scheduler.py # APScheduler wrapper for monthly cron job
 └── requirements.txt # Python dependencies
+
+## Known Data Gaps
+
+- **Toll plaza / rest area proximity** — `dist_nearest_toll_plaza_km` and
+  `dist_nearest_rest_area_km` were removed (see
+  `ev_pipeline/db/migrations/003_drop_unfillable_columns.sql`) because no
+  real toll-plaza/rest-area coordinate dataset exists in this codebase, and
+  fabricating plausible-looking coordinates for real highway infrastructure
+  isn't acceptable. If a real dataset becomes available (e.g. NHAI toll
+  plaza list), re-add the columns and a static reference list similar to
+  `config.settings.ANCHOR_CITIES` / `HIGHWAY_PAIRS`, then wire distance
+  computation into `features/geo_features.py`. Optional — only worth doing
+  if traffic-proximity turns out to matter for the prediction model.

@@ -71,6 +71,19 @@ def clean_str(val: Any) -> Optional[str]:
     return s if s else None
 
 
+def derive_station_name(
+    consumer_name: Optional[str] = None,
+    places_name: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Best available display name for a station: the TGSPDCL consumer_name
+    (the billing-account holder, e.g. 'BALAGONI SWATHI') is preferred since
+    it's always present from the seed PDFs; places_name (e.g. 'Ather Energy
+    Charging Station') is the fallback when consumer_name is missing.
+    """
+    return clean_str(consumer_name) or clean_str(places_name)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Date helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -136,6 +149,9 @@ def current_bill_month() -> str:
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Great-circle distance in kilometres."""
+    # Coerce to float — psycopg2 returns Postgres `numeric` columns as
+    # decimal.Decimal, which can't be mixed with float in arithmetic.
+    lat1, lon1, lat2, lon2 = float(lat1), float(lon1), float(lat2), float(lon2)
     R = 6371.0
     φ1, φ2 = math.radians(lat1), math.radians(lat2)
     dφ = math.radians(lat2 - lat1)

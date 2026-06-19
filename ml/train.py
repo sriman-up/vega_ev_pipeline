@@ -21,9 +21,15 @@ Cross-validation:
   Evaluation on the last 20% of rows (most recent months) per station.
 
 Usage:
-    python -m ev_pipeline.ml.train
-    python -m ev_pipeline.ml.train --no-shap  # skip SHAP (faster)
+    python -m ml.train
+    python -m ml.train --no-shap  # skip SHAP (faster)
 """
+
+# Defers evaluation of type annotations (e.g. `-> lgb.LGBMRegressor`) to strings,
+# so this module can still be imported when lightgbm isn't installed — `lgb`
+# only needs to exist at call time inside run_training(), which already checks
+# _HAS_LGB and raises a clear ImportError there.
+from __future__ import annotations
 
 import argparse
 import json
@@ -57,6 +63,14 @@ try:
     _HAS_SHAP = True
 except ImportError:
     _HAS_SHAP = False
+
+# ── matplotlib (optional — only needed for the SHAP importance plot) ─────────
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    _HAS_MPL = True
+except ImportError:
+    _HAS_MPL = False
 
 MODEL_DIR = Path(__file__).parent / "artifacts"
 MODEL_DIR.mkdir(exist_ok=True)
@@ -455,6 +469,13 @@ def run_training(
             zip(feature_names, model.feature_importances_)
         },
         "hyperparameters": LGBM_PARAMS,
+        # In-memory handles for callers that need to run inference without a
+        # round-trip through disk (e.g. ml/coldstart_validation.py's holdout
+        # model, which must never be saved to MODEL_DIR / become "latest").
+        # Leading underscore signals "not for DB logging" — insert_model_run()
+        # only reads specific named keys, so these are safely ignored there.
+        "_model": model,
+        "_feature_names": feature_names,
     }
     if log_to_db:
         try:

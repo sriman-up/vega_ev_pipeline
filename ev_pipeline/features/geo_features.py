@@ -19,7 +19,11 @@ import math
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from ev_pipeline.config.settings import HIGHWAY_PAIRS, HIGHWAY_PAIR_MAX_DIST_KM
+from ev_pipeline.config.settings import (
+    HIGHWAY_AVG_SPEED_KMH,
+    HIGHWAY_PAIR_MAX_DIST_KM,
+    HIGHWAY_PAIRS,
+)
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +33,9 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    # Coerce to float — psycopg2 returns Postgres `numeric` columns as
+    # decimal.Decimal, which can't be mixed with float in arithmetic.
+    lat1, lon1, lat2, lon2 = float(lat1), float(lon1), float(lat2), float(lon2)
     R = 6371.0
     φ1, φ2 = math.radians(lat1), math.radians(lat2)
     dφ = math.radians(lat2 - lat1)
@@ -90,6 +97,7 @@ def compute_geo_features(lat: float, lon: float) -> Dict[str, Any]:
     """
     if not lat or not lon:
         return {}
+    lat, lon = float(lat), float(lon)
 
     best: Optional[Dict] = None
     best_perp = float("inf")
@@ -149,6 +157,10 @@ def compute_geo_features(lat: float, lon: float) -> Dict[str, Any]:
         "total_highway_length_km":  round(total_km, 2),
         "highway_position_ratio":   round(t, 4),
         "direction_side":           direction_side,
+        # Heuristic estimate (distance / HIGHWAY_AVG_SPEED_KMH) — no Distance
+        # Matrix API is configured, so this is not live traffic-aware travel time.
+        "travel_time_from_city_a_min": round(dist_from_a / HIGHWAY_AVG_SPEED_KMH * 60, 1),
+        "travel_time_from_city_b_min": round(dist_from_b / HIGHWAY_AVG_SPEED_KMH * 60, 1),
     }
 
 
@@ -171,6 +183,7 @@ def nearest_city(lat: float, lon: float) -> Dict[str, Any]:
     """Return name and distance to nearest major city."""
     if not lat or not lon:
         return {}
+    lat, lon = float(lat), float(lon)
     dists = [
         (haversine_km(lat, lon, clat, clon), name)
         for name, clat, clon in MAJOR_CITIES

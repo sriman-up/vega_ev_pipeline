@@ -1,256 +1,287 @@
--- db/schema.sql
--- PostgreSQL / Supabase schema for EV station performance prediction pipeline
--- Run once:  psql "<connection-string>" -f schema.sql
--- Or paste into Supabase Dashboard → SQL Editor
+-- WARNING: This schema is for context only and is not meant to be run.
+-- Table order and constraints may not be valid for execution.
 
--- ─────────────────────────────────────────────────────────────────────────────
--- STATIONS  (one row per unique service connection / SCNo)
--- ─────────────────────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS stations (
-    id                  SERIAL PRIMARY KEY,
-    unique_scno         VARCHAR(20)  NOT NULL UNIQUE,
-    service_number      VARCHAR(20),
-    consumer_name       VARCHAR(200),
-    address             TEXT,
-    pin_code            VARCHAR(10),
-    phone               VARCHAR(20),
-    category            VARCHAR(10),
-    sub_category        VARCHAR(10),
-    consumer_type       VARCHAR(10),          -- HV / LT
-    section_code_name   VARCHAR(100),
-    ero_name            VARCHAR(100),
-    circle_name         VARCHAR(100),
-    sub_division        VARCHAR(20),
-    area_code           VARCHAR(20),
-    supply_date         DATE,
-    contracted_load_kva NUMERIC(10,2),
-    connected_load_kva  NUMERIC(10,2),
-    meter_number        VARCHAR(30),
-    meter_phase         SMALLINT,
-    multiplying_factor  NUMERIC(6,3),
-    security_deposit    NUMERIC(12,2),
-
-    -- ── Charger inventory ──────────────────────────────────────────────────
-    charger_30kw_count  SMALLINT,
-    charger_60kw_count  SMALLINT,
-    charger_120kw_count SMALLINT,
-    charger_150kw_count SMALLINT,
-    charger_other_json  JSONB,               -- {"50kw": 2, "240kw": 1} etc.
-    total_charger_count SMALLINT,
-    total_power_kw      NUMERIC(8,2),        -- sum of all charger capacities
-
-    -- ── Google Places enrichment ───────────────────────────────────────────
-    latitude            NUMERIC(12,8),
-    longitude           NUMERIC(12,8),
-    places_id           VARCHAR(100),
-    places_name         VARCHAR(200),
-    places_rating       NUMERIC(3,1),
-    places_user_ratings_total INT,
-    has_attached_restaurant   BOOLEAN,
-
-    -- ── Location type (from Places 'types' field) ─────────────────────────
-    -- e.g. gas_station, shopping_mall, highway_rest_area, hotel, parking
-    location_type       VARCHAR(50),
-    location_type_raw   JSONB,               -- full Places types array
-
-    -- ── Competition (1 km radius, refreshed monthly) ───────────────────────
-    nearby_ev_stations_1km    SMALLINT,
-    nearby_restaurants_1km    SMALLINT,
-    nearby_hotels_1km         SMALLINT,
-    nearby_petrol_pumps_1km   SMALLINT,
-    nearby_shopping_1km       SMALLINT,      -- malls, supermarkets
-    competition_last_updated  TIMESTAMP,
-
-    -- ── Highway geo features ───────────────────────────────────────────────
-    highway_name              VARCHAR(100),
-    nearest_city_a            VARCHAR(100),
-    nearest_city_b            VARCHAR(100),
-    dist_from_city_a_km       NUMERIC(8,2),
-    dist_from_city_b_km       NUMERIC(8,2),
-    dist_from_midpoint_km     NUMERIC(8,2),
-    dist_from_quarter_a_km    NUMERIC(8,2),
-    dist_from_quarter_b_km    NUMERIC(8,2),
-    total_highway_length_km   NUMERIC(8,2),
-    highway_position_ratio    NUMERIC(5,4),  -- 0.0=city_a  1.0=city_b
-    direction_side            VARCHAR(40),   -- outgoing_from_a | outgoing_from_b | midpoint_zone
-
-    -- ── Road traffic proxy (from Google Maps Distance Matrix, optional) ───
-    -- average travel time from nearest city (minutes) — higher = more remote
-    travel_time_from_city_a_min  NUMERIC(8,2),
-    travel_time_from_city_b_min  NUMERIC(8,2),
-
-    -- ── Nearest major amenity distances (km) ──────────────────────────────
-    dist_nearest_city_km         NUMERIC(8,2),
-    nearest_major_city           VARCHAR(100),
-    dist_nearest_toll_plaza_km   NUMERIC(8,2),
-    dist_nearest_rest_area_km    NUMERIC(8,2),
-
-    -- ── Metadata ───────────────────────────────────────────────────────────
-    created_at          TIMESTAMP DEFAULT NOW(),
-    updated_at          TIMESTAMP DEFAULT NOW()
+CREATE TABLE public.stations (
+  id integer NOT NULL DEFAULT nextval('stations_id_seq'::regclass),
+  unique_scno character varying NOT NULL UNIQUE,
+  service_number character varying,
+  consumer_name character varying,
+  address text,
+  pin_code character varying,
+  phone character varying,
+  category character varying,
+  sub_category character varying,
+  consumer_type character varying,
+  section_code_name character varying,
+  ero_name character varying,
+  circle_name character varying,
+  sub_division character varying,
+  area_code character varying,
+  supply_date date,
+  contracted_load_kva numeric,
+  connected_load_kva numeric,
+  meter_number character varying,
+  meter_phase smallint,
+  multiplying_factor numeric,
+  security_deposit numeric,
+  charger_30kw_count smallint,
+  charger_60kw_count smallint,
+  charger_120kw_count smallint,
+  charger_150kw_count smallint,
+  charger_other_json jsonb,
+  total_charger_count smallint,
+  total_power_kw numeric,
+  latitude numeric,
+  longitude numeric,
+  places_id character varying,
+  places_name character varying,
+  places_rating numeric,
+  places_user_ratings_total integer,
+  has_attached_restaurant boolean,
+  location_type character varying,
+  location_type_raw jsonb,
+  nearby_ev_stations_1km smallint,
+  nearby_restaurants_1km smallint,
+  nearby_hotels_1km smallint,
+  nearby_petrol_pumps_1km smallint,
+  nearby_shopping_1km smallint,
+  competition_last_updated timestamp without time zone,
+  highway_name character varying,
+  nearest_city_a character varying,
+  nearest_city_b character varying,
+  dist_from_city_a_km numeric,
+  dist_from_city_b_km numeric,
+  dist_from_midpoint_km numeric,
+  dist_from_quarter_a_km numeric,
+  dist_from_quarter_b_km numeric,
+  total_highway_length_km numeric,
+  highway_position_ratio numeric,
+  direction_side character varying,
+  travel_time_from_city_a_min numeric,
+  travel_time_from_city_b_min numeric,
+  dist_nearest_city_km numeric,
+  nearest_major_city character varying,
+  created_at timestamp without time zone DEFAULT now(),
+  updated_at timestamp without time zone DEFAULT now(),
+  station_name character varying,
+  status character varying DEFAULT 'active'::character varying,
+  commissioning_date date,
+  last_bill_month date,
+  avg_monthly_kwh_lifetime numeric,
+  predicted_next_month_kwh numeric,
+  predicted_at timestamp without time zone,
+  is_low_performer boolean,
+  cpo character varying,
+  tariff_inr_per_kwh numeric,
+  tariff_basis character varying,
+  tariff_source_note text,
+  tariff_last_updated date,
+  h3_res5 text,
+  h3_res6 text,
+  h3_res7 text,
+  nearest_city character varying,
+  dist_to_city_km numeric,
+  zone_band character varying,
+  CONSTRAINT stations_pkey PRIMARY KEY (id)
 );
-
--- ─────────────────────────────────────────────────────────────────────────────
--- MONTHLY_BILLS  (raw billing data — one row per station per month)
--- ─────────────────────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS monthly_bills (
-    id                   SERIAL PRIMARY KEY,
-    station_id           INT NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
-    unique_scno          VARCHAR(20) NOT NULL,
-    bill_month           DATE NOT NULL,
-
-    -- Raw TGSPDCL fields
-    status               VARCHAR(5),
-    category_ab          VARCHAR(10),
-    kwh_closing_reading  NUMERIC(12,2),
-    kwh_units            NUMERIC(10,2),
-    kvah_closing_reading NUMERIC(12,2),
-    kvah_units           NUMERIC(10,2),
-    billed_units         NUMERIC(10,2),
-    demand_rs            NUMERIC(12,2),
-    fixed_charges_rs     NUMERIC(12,2),
-    je_debit_rs          NUMERIC(12,2),
-    collection_rs        NUMERIC(12,2),
-    je_credit_rs         NUMERIC(12,2),
-    arrears_rs           NUMERIC(12,2),
-    rmd_kva              NUMERIC(8,2),
-    cmd_kva              NUMERIC(8,2),
-    comp_load            NUMERIC(8,2),
-    bill_md              NUMERIC(8,2),
-    power_factor         NUMERIC(5,3),
-    bill_date            DATE,
-    lc_side              VARCHAR(10),
-
-    -- Derived rolling features (backfilled by consumption_features.py)
-    rolling_avg_3m_kwh   NUMERIC(10,2),
-    rolling_avg_6m_kwh   NUMERIC(10,2),
-    kwh_mom_change       NUMERIC(10,2),
-    kwh_yoy_change       NUMERIC(10,2),
-    kwh_growth_rate_pct  NUMERIC(8,4),
-    is_anomaly           BOOLEAN,
-
-    -- Source tracking
-    source               VARCHAR(20) DEFAULT 'pdf_import',
-    scraped_at           TIMESTAMP DEFAULT NOW(),
-
-    UNIQUE (unique_scno, bill_month)
+CREATE TABLE public.monthly_bills (
+  id integer NOT NULL DEFAULT nextval('monthly_bills_id_seq'::regclass),
+  station_id integer NOT NULL,
+  unique_scno character varying NOT NULL,
+  bill_month date NOT NULL,
+  status character varying,
+  category_ab character varying,
+  kwh_closing_reading numeric,
+  kwh_units numeric,
+  kvah_closing_reading numeric,
+  kvah_units numeric,
+  billed_units numeric,
+  demand_rs numeric,
+  fixed_charges_rs numeric,
+  je_debit_rs numeric,
+  collection_rs numeric,
+  je_credit_rs numeric,
+  arrears_rs numeric,
+  rmd_kva numeric,
+  cmd_kva numeric,
+  comp_load numeric,
+  bill_md numeric,
+  power_factor numeric,
+  bill_date date,
+  lc_side character varying,
+  rolling_avg_3m_kwh numeric,
+  rolling_avg_6m_kwh numeric,
+  kwh_mom_change numeric,
+  kwh_yoy_change numeric,
+  kwh_growth_rate_pct numeric,
+  is_anomaly boolean,
+  source character varying DEFAULT 'pdf_import'::character varying,
+  scraped_at timestamp without time zone DEFAULT now(),
+  CONSTRAINT monthly_bills_pkey PRIMARY KEY (id),
+  CONSTRAINT monthly_bills_station_id_fkey FOREIGN KEY (station_id) REFERENCES public.stations(id)
 );
-
--- ─────────────────────────────────────────────────────────────────────────────
--- MONTHLY_WEATHER  (weather context per station per month — from Open-Meteo)
--- ─────────────────────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS monthly_weather (
-    id                      SERIAL PRIMARY KEY,
-    unique_scno             VARCHAR(20) NOT NULL,
-    weather_month           DATE NOT NULL,           -- 1st of month
-    avg_temp_c              NUMERIC(5,2),
-    max_temp_c              NUMERIC(5,2),
-    min_temp_c              NUMERIC(5,2),
-    total_rainfall_mm       NUMERIC(8,2),
-    avg_humidity_pct        NUMERIC(5,2),
-    avg_wind_speed_kmh      NUMERIC(6,2),
-    heatwave_days           SMALLINT,                -- days > 40°C
-    rainfall_days           SMALLINT,                -- days with > 2.5mm rain
-    fetched_at              TIMESTAMP DEFAULT NOW(),
-    UNIQUE (unique_scno, weather_month)
+CREATE TABLE public.monthly_weather (
+  id integer NOT NULL DEFAULT nextval('monthly_weather_id_seq'::regclass),
+  unique_scno character varying NOT NULL,
+  weather_month date NOT NULL,
+  avg_temp_c numeric,
+  max_temp_c numeric,
+  min_temp_c numeric,
+  total_rainfall_mm numeric,
+  avg_humidity_pct numeric,
+  avg_wind_speed_kmh numeric,
+  heatwave_days smallint,
+  rainfall_days smallint,
+  fetched_at timestamp without time zone DEFAULT now(),
+  CONSTRAINT monthly_weather_pkey PRIMARY KEY (id)
 );
-
--- ─────────────────────────────────────────────────────────────────────────────
--- STATION_FEATURES  (wide ML-ready feature table, rebuilt monthly)
--- ─────────────────────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS station_features (
-    id                              SERIAL PRIMARY KEY,
-    station_id                      INT NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
-    unique_scno                     VARCHAR(20) NOT NULL,
-    feature_month                   DATE NOT NULL,
-
-    -- ── Consumption history features ──────────────────────────────────────
-    avg_kwh_units                   NUMERIC(10,2),
-    std_kwh_units                   NUMERIC(10,2),
-    months_active                   SMALLINT,
-    kwh_growth_rate_overall         NUMERIC(8,4),
-    rolling_avg_3m_kwh              NUMERIC(10,2),
-    rolling_avg_6m_kwh              NUMERIC(10,2),
-    max_kwh_units                   NUMERIC(10,2),
-    min_kwh_units                   NUMERIC(10,2),
-    seasonal_summer_avg_kwh         NUMERIC(10,2),
-    seasonal_winter_avg_kwh         NUMERIC(10,2),
-    pct_months_zero_consumption     NUMERIC(5,2),
-    kwh_coefficient_of_variation    NUMERIC(8,4),
-    demand_cliff_detected           BOOLEAN,
-
-    -- ── Station capacity & infrastructure ────────────────────────────────
-    contracted_load_kva             NUMERIC(10,2),
-    total_charger_count             SMALLINT,
-    charger_30kw_count              SMALLINT,
-    charger_60kw_count              SMALLINT,
-    charger_120kw_count             SMALLINT,
-    charger_150kw_count             SMALLINT,
-    total_power_kw                  NUMERIC(8,2),    -- total installed charging capacity
-    charger_mix_ratio               NUMERIC(5,4),    -- fast (>=60kW) / total chargers
-    power_utilisation_pct           NUMERIC(6,2),    -- avg_kwh / (total_power_kw * 720hrs)
-    meter_phase                     SMALLINT,
-    security_deposit                NUMERIC(12,2),
-
-    -- ── Competition & amenity ─────────────────────────────────────────────
-    nearby_ev_stations_1km          SMALLINT,
-    nearby_restaurants_1km          SMALLINT,
-    nearby_hotels_1km               SMALLINT,
-    nearby_petrol_pumps_1km         SMALLINT,
-    nearby_shopping_1km             SMALLINT,
-    has_attached_restaurant         BOOLEAN,
-    places_rating                   NUMERIC(3,1),
-    places_user_ratings_total       INT,
-    competition_intensity           NUMERIC(5,4),    -- 0–1 score
-    amenity_score                   NUMERIC(5,4),    -- 0–1 score
-    location_type                   VARCHAR(50),     -- gas_station / hotel / mall etc.
-
-    -- ── Highway & geo ─────────────────────────────────────────────────────
-    dist_from_city_a_km             NUMERIC(8,2),
-    dist_from_city_b_km             NUMERIC(8,2),
-    dist_from_midpoint_km           NUMERIC(8,2),
-    dist_from_quarter_a_km          NUMERIC(8,2),
-    dist_from_quarter_b_km          NUMERIC(8,2),
-    highway_position_ratio          NUMERIC(5,4),
-    direction_side                  VARCHAR(40),
-    total_highway_length_km         NUMERIC(8,2),
-    dist_nearest_toll_plaza_km      NUMERIC(8,2),
-    dist_nearest_rest_area_km       NUMERIC(8,2),
-    travel_time_from_city_a_min     NUMERIC(8,2),
-
-    -- ── Weather context (month being predicted) ───────────────────────────
-    avg_temp_c                      NUMERIC(5,2),
-    max_temp_c                      NUMERIC(5,2),
-    total_rainfall_mm               NUMERIC(8,2),
-    avg_humidity_pct                NUMERIC(5,2),
-    heatwave_days                   SMALLINT,
-    rainfall_days                   SMALLINT,
-
-    -- ── Calendar / seasonality ────────────────────────────────────────────
-    month_of_year                   SMALLINT,        -- 1–12
-    quarter                         SMALLINT,        -- 1–4
-    is_summer                       BOOLEAN,         -- Apr–Jun (peak EV cooling load)
-    is_monsoon                      BOOLEAN,         -- Jul–Sep
-    is_festival_month               BOOLEAN,         -- Diwali/Dussehra months (Oct/Nov)
-    days_in_month                   SMALLINT,
-
-    -- ── EV market maturity proxy ──────────────────────────────────────────
-    -- Months since station opened — controls for ramp-up period
-    months_since_opening            SMALLINT,
-    is_ramp_up_phase                BOOLEAN,         -- first 6 months
-
-    -- ── Target variable ───────────────────────────────────────────────────
-    next_month_kwh                  NUMERIC(10,2),   -- filled on next monthly cycle
-
-    computed_at  TIMESTAMP DEFAULT NOW(),
-    UNIQUE (unique_scno, feature_month)
+CREATE TABLE public.station_features (
+  id integer NOT NULL DEFAULT nextval('station_features_id_seq'::regclass),
+  station_id integer NOT NULL,
+  unique_scno character varying NOT NULL,
+  feature_month date NOT NULL,
+  avg_kwh_units numeric,
+  std_kwh_units numeric,
+  months_active smallint,
+  kwh_growth_rate_overall numeric,
+  rolling_avg_3m_kwh numeric,
+  rolling_avg_6m_kwh numeric,
+  max_kwh_units numeric,
+  min_kwh_units numeric,
+  seasonal_summer_avg_kwh numeric,
+  seasonal_winter_avg_kwh numeric,
+  pct_months_zero_consumption numeric,
+  kwh_coefficient_of_variation numeric,
+  demand_cliff_detected boolean,
+  contracted_load_kva numeric,
+  total_charger_count smallint,
+  charger_30kw_count smallint,
+  charger_60kw_count smallint,
+  charger_120kw_count smallint,
+  charger_150kw_count smallint,
+  total_power_kw numeric,
+  charger_mix_ratio numeric,
+  power_utilisation_pct numeric,
+  estimated_uptime_hours numeric,
+  meter_phase smallint,
+  security_deposit numeric,
+  nearby_ev_stations_1km smallint,
+  nearby_restaurants_1km smallint,
+  nearby_hotels_1km smallint,
+  nearby_petrol_pumps_1km smallint,
+  nearby_shopping_1km smallint,
+  has_attached_restaurant boolean,
+  places_rating numeric,
+  places_user_ratings_total integer,
+  competition_intensity numeric,
+  amenity_score numeric,
+  location_type character varying,
+  dist_from_city_a_km numeric,
+  dist_from_city_b_km numeric,
+  dist_from_midpoint_km numeric,
+  dist_from_quarter_a_km numeric,
+  dist_from_quarter_b_km numeric,
+  highway_position_ratio numeric,
+  direction_side character varying,
+  total_highway_length_km numeric,
+  travel_time_from_city_a_min numeric,
+  avg_temp_c numeric,
+  max_temp_c numeric,
+  total_rainfall_mm numeric,
+  avg_humidity_pct numeric,
+  heatwave_days smallint,
+  rainfall_days smallint,
+  month_of_year smallint,
+  quarter smallint,
+  is_summer boolean,
+  is_monsoon boolean,
+  is_festival_month boolean,
+  days_in_month smallint,
+  months_since_opening smallint,
+  is_ramp_up_phase boolean,
+  next_month_kwh numeric,
+  computed_at timestamp without time zone DEFAULT now(),
+  CONSTRAINT station_features_pkey PRIMARY KEY (id),
+  CONSTRAINT station_features_station_id_fkey FOREIGN KEY (station_id) REFERENCES public.stations(id)
 );
-
--- ─────────────────────────────────────────────────────────────────────────────
--- INDEXES
--- ─────────────────────────────────────────────────────────────────────────────
-CREATE INDEX IF NOT EXISTS idx_monthly_bills_scno_month   ON monthly_bills    (unique_scno, bill_month);
-CREATE INDEX IF NOT EXISTS idx_station_features_scno      ON station_features (unique_scno, feature_month);
-CREATE INDEX IF NOT EXISTS idx_station_features_month     ON station_features (feature_month);
-CREATE INDEX IF NOT EXISTS idx_stations_scno              ON stations         (unique_scno);
-CREATE INDEX IF NOT EXISTS idx_monthly_weather_scno_month ON monthly_weather  (unique_scno, weather_month);
+CREATE TABLE public.station_alerts (
+  id integer NOT NULL DEFAULT nextval('station_alerts_id_seq'::regclass),
+  station_id integer NOT NULL,
+  unique_scno character varying NOT NULL,
+  alert_type character varying,
+  severity character varying,
+  alert_month date,
+  message text,
+  resolved boolean DEFAULT false,
+  created_at timestamp without time zone DEFAULT now(),
+  CONSTRAINT station_alerts_pkey PRIMARY KEY (id),
+  CONSTRAINT station_alerts_station_id_fkey FOREIGN KEY (station_id) REFERENCES public.stations(id)
+);
+CREATE TABLE public.h3_coverage_zones (
+  h3_index text NOT NULL,
+  resolution integer,
+  center_lat double precision,
+  center_lng double precision,
+  station_count integer,
+  nearest_station_dist_km double precision,
+  is_coverage_gap boolean,
+  pop_density_per_sqkm double precision,
+  highway_overlap boolean,
+  CONSTRAINT h3_coverage_zones_pkey PRIMARY KEY (h3_index)
+);
+CREATE TABLE public.zone_fleet_mix (
+  id integer NOT NULL DEFAULT nextval('zone_fleet_mix_id_seq'::regclass),
+  zone_band character varying NOT NULL,
+  vehicle_type character varying NOT NULL,
+  fleet_share_pct numeric,
+  range_km numeric,
+  battery_kwh numeric,
+  charge_rate_kw numeric,
+  typical_soc_start_pct numeric,
+  typical_soc_end_pct numeric,
+  avg_session_kwh numeric,
+  source_note text,
+  last_updated date,
+  CONSTRAINT zone_fleet_mix_pkey PRIMARY KEY (id),
+  CONSTRAINT zone_fleet_mix_zone_vehicle_unique UNIQUE (zone_band, vehicle_type)
+);
+CREATE TABLE public.model_runs (
+  id integer NOT NULL DEFAULT nextval('model_runs_id_seq'::regclass),
+  model_version character varying NOT NULL,
+  trained_at timestamp without time zone DEFAULT now(),
+  n_stations integer,
+  n_training_rows integer,
+  n_test_rows integer,
+  cv_mae numeric,
+  cv_rmse numeric,
+  cv_mape numeric,
+  test_mae numeric,
+  test_rmse numeric,
+  test_mape numeric,
+  feature_importances jsonb,
+  hyperparameters jsonb,
+  CONSTRAINT model_runs_pkey PRIMARY KEY (id),
+  CONSTRAINT model_runs_version_unique UNIQUE (model_version)
+);
+CREATE TABLE public.model_predictions (
+  id integer NOT NULL DEFAULT nextval('model_predictions_id_seq'::regclass),
+  station_id integer NOT NULL,
+  unique_scno character varying NOT NULL,
+  feature_month date NOT NULL,
+  prediction_month date NOT NULL,
+  predicted_kwh numeric,
+  predicted_kwh_lower numeric,
+  predicted_kwh_upper numeric,
+  is_low_performer boolean,
+  low_performer_threshold numeric,
+  low_performer_reason text,
+  model_version character varying,
+  model_trained_on date,
+  actual_kwh numeric,
+  abs_error numeric,
+  pct_error numeric,
+  predicted_at timestamp without time zone DEFAULT now(),
+  CONSTRAINT model_predictions_pkey PRIMARY KEY (id),
+  CONSTRAINT model_predictions_unique UNIQUE (unique_scno, prediction_month),
+  CONSTRAINT model_predictions_station_id_fkey FOREIGN KEY (station_id) REFERENCES public.stations(id)
+);

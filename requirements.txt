@@ -4,6 +4,7 @@ beautifulsoup4>=4.12.0
 pdfplumber>=0.10.3
 numpy>=1.26.0
 psycopg2-binary>=2.9.9
+h3>=4.0.0          # H3 hex tiling for coverage-gap analysis
 
 # Scheduling
 APScheduler>=3.10.4
@@ -15,3 +16,12 @@ APScheduler>=3.10.4
 # Dev / notebook
 pandas>=2.2.0        # useful for exploratory analysis
 scikit-learn>=1.4.0  # for model training
+
+# ML (ml/train.py, ml/predict.py, ml/eda.py)
+lightgbm>=4.3.0
+shap>=0.45.0         # optional — feature importance plots, training degrades gracefully without it
+matplotlib>=3.8.0    # optional — EDA/SHAP plots, both degrade gracefully without it
+
+# API (api/main.py — serves ml/site_simulator.py to the dashboard)
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0

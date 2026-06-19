@@ -11,8 +11,8 @@ Also provides prediction intervals via LightGBM quantile regression
 (10th / 90th percentile models trained alongside the main model).
 
 Usage:
-    python -m ev_pipeline.ml.predict
-    python -m ev_pipeline.ml.predict --version 20260612_0800
+    python -m ml.predict
+    python -m ml.predict --version 20260612_0800
 """
 
 import argparse
@@ -26,7 +26,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from ev_pipeline.ml.train import (
+from ml.train import (
     MODEL_DIR,
     TARGET,
     compute_low_performer_thresholds,
@@ -57,7 +57,7 @@ def _train_quantile_models(
     except ImportError:
         return None, None
 
-    from ev_pipeline.ml.train import LGBM_PARAMS
+    from ml.train import LGBM_PARAMS
 
     q10_params = {**LGBM_PARAMS, "objective": "quantile", "alpha": 0.10}
     q90_params = {**LGBM_PARAMS, "objective": "quantile", "alpha": 0.90}

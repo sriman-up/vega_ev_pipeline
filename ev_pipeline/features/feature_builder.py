@@ -42,8 +42,6 @@ HIGHWAY POSITION
   or 85–100% serve top-up demand from city-edge drivers.
   direction_side matters because morning traffic (outgoing from Hyd) and
   evening return traffic peak at different stations.
-  dist_nearest_toll_plaza_km is a strong traffic proxy — toll plazas force
-  slowdowns and drivers notice nearby charging signs.
 
 WEATHER
   Heat (>38°C) increases cabin AC load → higher per-km consumption → more
@@ -120,7 +118,7 @@ def build_feature_row(
 
     for k in ("kwh_mom_change", "kwh_yoy_change", "kwh_growth_rate_pct", "is_anomaly"):
         row.pop(k, None)
-    print(row)
+
     # ── 2. Competition & amenity features ─────────────────────────────────────
     comp = compute_competition_features(station, history)
     # Merge only the fields that belong in station_features
@@ -163,13 +161,18 @@ def build_feature_row(
         hours_in_month = calendar.monthrange(fm_date.year, fm_date.month)[1] * 24
         theoretical_max = total_power * hours_in_month
         row["power_utilisation_pct"] = round(100 * avg_kwh / theoretical_max, 4)
+        # Same signal in hours rather than percent — easier to read on a dashboard
+        # ("ran at full rated power for ~150h out of 720h possible"). Assumes
+        # chargers draw their full rated kW whenever in use; not fed to the model
+        # since it's a near-perfect linear rescale of power_utilisation_pct
+        # (collinear — would add no information, only noise from day-count).
+        row["estimated_uptime_hours"] = round(avg_kwh / total_power, 2)
 
     # ── 4. Highway & geo features ─────────────────────────────────────────────
     for key in (
         "dist_from_city_a_km", "dist_from_city_b_km", "dist_from_midpoint_km",
         "dist_from_quarter_a_km", "dist_from_quarter_b_km",
         "highway_position_ratio", "direction_side", "total_highway_length_km",
-        "dist_nearest_toll_plaza_km", "dist_nearest_rest_area_km",
         "travel_time_from_city_a_min",
     ):
         if station.get(key) is not None:

@@ -13,9 +13,9 @@ Produces a self-contained HTML report covering:
   8. Highway position vs usage (position_ratio vs avg kWh)
 
 Usage:
-    python -m ev_pipeline.ml.eda --out reports/eda.html
+    python -m ml.eda --out reports/eda.html
     # or from pipeline:
-    from ev_pipeline.ml.eda import run_eda
+    from ml.eda import run_eda
     run_eda(output_path="reports/eda.html")
 """
 

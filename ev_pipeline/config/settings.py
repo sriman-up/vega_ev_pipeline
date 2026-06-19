@@ -118,6 +118,49 @@ HIGHWAY_PAIRS = [
 # Max distance (km) from a highway pair to associate the station with it
 HIGHWAY_PAIR_MAX_DIST_KM = 10
 
+# Assumed average road speed (km/h) used to estimate travel_time_from_city_a/b_min
+# from the highway-projection distances. Heuristic only — no Distance Matrix API
+# is configured. ~55 km/h reflects mixed NH traffic (tolls, town stretches, trucks)
+# rather than free-flow speed limits.
+HIGHWAY_AVG_SPEED_KMH = 55
+
+# ── H3 hex tiling ────────────────────────────────────────────────────────────
+H3_RESOLUTIONS = [5, 6, 7]
+
+# India's stated ~30 km inter-station spacing target for highway EV corridors
+# implies a ~15 km service radius — a hex farther than this from every
+# station is flagged as a coverage gap.
+H3_COVERAGE_GAP_KM = 15.0
+
+# Rectangular approximation of the Telangana state boundary, used to enumerate
+# the full hex grid for coverage-gap analysis. Not the precise state polygon —
+# a thin border of hexes just outside Telangana will also be generated (and
+# likely flagged as gaps). Swap in a real GeoJSON polygon if that matters.
+TELANGANA_BBOX = {
+    "min_lat": 15.80, "max_lat": 19.95,
+    "min_lon": 77.25, "max_lon": 81.35,
+}
+
+# ── Concentric city zones ─────────────────────────────────────────────────────
+# Anchor cities for radial zone banding (distinct from HIGHWAY_PAIRS / the
+# nearest_major_city lookup in geo_features.py, which serve highway-projection
+# features). Each entry: (city_name, lat, lon).
+ANCHOR_CITIES = [
+    ("Hyderabad",  17.3850, 78.4867),
+    ("Warangal",   17.9784, 79.5941),
+    ("Nizamabad",  18.6725, 78.0941),
+    ("Khammam",    17.2473, 80.1514),
+    ("Karimnagar", 18.4386, 79.1288),
+]
+
+# Zone band upper bounds (km) from the nearest anchor city, checked in order.
+# Anything beyond the last bound falls into "remote".
+ZONE_BAND_BOUNDS_KM = [
+    (30,  "core"),
+    (60,  "periurban"),
+    (120, "highway"),
+]
+
 # ── Scheduling ────────────────────────────────────────────────────────────────
 # Day of month to run the monthly scrape (1-28)
 MONTHLY_SCRAPE_DAY = 10

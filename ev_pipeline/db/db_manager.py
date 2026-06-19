@@ -13,6 +13,7 @@ import logging
 from contextlib import contextmanager
 from typing import Any, Dict, Generator, List, Optional
 
+import pandas as pd
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
@@ -188,6 +189,18 @@ def get_station_billing_history(unique_scno: str) -> List[Dict]:
             return [dict(r) for r in cur.fetchall()]
 
 
+def get_monthly_weather(unique_scno: str, weather_month: str) -> Optional[Dict]:
+    """Cached weather lookup — avoids re-hitting Open-Meteo for a month already fetched."""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM monthly_weather WHERE unique_scno = %s AND weather_month = %s",
+                (unique_scno, weather_month),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
 def get_latest_bill_month(unique_scno: str) -> Optional[str]:
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -224,6 +237,207 @@ def get_feature_vectors(
                 params,
             )
             return [dict(r) for r in cur.fetchall()]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Derived-field backfill helpers (station_name, commissioning_date, bill summary)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def bulk_backfill_station_names() -> int:
+    """
+    Set station_name from consumer_name (fallback places_name) for any row
+    where it's still NULL. Matches utils.helpers.derive_station_name's
+    preference order.
+    """
+    sql = """
+        UPDATE stations
+        SET station_name = COALESCE(NULLIF(TRIM(consumer_name), ''), places_name)
+        WHERE station_name IS NULL
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            n = cur.rowcount
+    log.info("Backfilled station_name for %d stations", n)
+    return n
+
+
+def bulk_backfill_commissioning_dates() -> int:
+    """commissioning_date mirrors supply_date — there's no separate EV-charger
+    go-live date source in this pipeline (see README 'Known Data Gaps')."""
+    sql = """
+        UPDATE stations
+        SET commissioning_date = supply_date
+        WHERE commissioning_date IS NULL AND supply_date IS NOT NULL
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            n = cur.rowcount
+    log.info("Backfilled commissioning_date for %d stations", n)
+    return n
+
+
+def refresh_all_station_bill_summaries() -> int:
+    """
+    Recompute stations.last_bill_month and avg_monthly_kwh_lifetime from
+    monthly_bills for every station in one statement.
+    """
+    sql = """
+        UPDATE stations s
+        SET last_bill_month         = agg.last_month,
+            avg_monthly_kwh_lifetime = agg.avg_kwh
+        FROM (
+            SELECT station_id,
+                   MAX(bill_month)        AS last_month,
+                   AVG(kwh_units)         AS avg_kwh
+            FROM monthly_bills
+            WHERE kwh_units IS NOT NULL
+            GROUP BY station_id
+        ) agg
+        WHERE s.id = agg.station_id
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            n = cur.rowcount
+    log.info("Refreshed bill summary (last_bill_month, avg_monthly_kwh_lifetime) for %d stations", n)
+    return n
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Spatial layer write/read API (H3 coverage grid + fleet mix reference table)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def bulk_upsert_h3_coverage_zones(rows: List[Dict[str, Any]]) -> int:
+    """
+    Bulk insert/update h3_coverage_zones rows in a single multi-row statement.
+    Resolution-7 grids over Telangana run into the tens of thousands of hexes,
+    so this avoids the per-row round-trip cost of the generic _upsert() helper.
+    """
+    if not rows:
+        return 0
+    cols = [
+        "h3_index", "resolution", "center_lat", "center_lng",
+        "station_count", "nearest_station_dist_km", "is_coverage_gap",
+        "highway_overlap",
+    ]
+    values = [tuple(row.get(c) for c in cols) for row in rows]
+    set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c != "h3_index")
+    sql = f"""
+        INSERT INTO h3_coverage_zones ({', '.join(cols)})
+        VALUES %s
+        ON CONFLICT (h3_index) DO UPDATE SET {set_clause}
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(cur, sql, values, page_size=1000)
+    log.info("Bulk upserted %d h3_coverage_zones rows", len(rows))
+    return len(rows)
+
+
+def get_h3_coverage_zones(resolution: Optional[int] = None, gaps_only: bool = False) -> List[Dict]:
+    clauses: List[str] = []
+    params: List[Any] = []
+    if resolution is not None:
+        clauses.append("resolution = %s")
+        params.append(resolution)
+    if gaps_only:
+        clauses.append("is_coverage_gap = true")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"SELECT * FROM h3_coverage_zones {where} ORDER BY resolution, h3_index",
+                params,
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def upsert_zone_fleet_mix(data: Dict[str, Any]) -> None:
+    """Insert or update a single zone_fleet_mix row, keyed on (zone_band, vehicle_type)."""
+    _upsert("zone_fleet_mix", data, conflict_cols=["zone_band", "vehicle_type"], returning=None)
+
+
+def get_zone_fleet_mix(zone_band: Optional[str] = None) -> List[Dict]:
+    clauses: List[str] = []
+    params: List[Any] = []
+    if zone_band:
+        clauses.append("zone_band = %s")
+        params.append(zone_band)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"SELECT * FROM zone_fleet_mix {where} ORDER BY zone_band, vehicle_type",
+                params,
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ML feature matrix / model run / prediction API (used by ml/eda.py, train.py, predict.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_feature_matrix(min_months: int = 1) -> pd.DataFrame:
+    """
+    Load every station_features row for stations that have at least
+    `min_months` rows of history. Used for EDA and training, where we need
+    the full time series per station rather than just the latest row.
+    """
+    sql = """
+        SELECT sf.*
+        FROM station_features sf
+        WHERE sf.unique_scno IN (
+            SELECT unique_scno FROM station_features
+            GROUP BY unique_scno
+            HAVING COUNT(*) >= %s
+        )
+        ORDER BY sf.unique_scno, sf.feature_month
+    """
+    with get_conn() as conn:
+        return pd.read_sql(sql, conn, params=(min_months,))
+
+
+def get_latest_feature_vectors() -> pd.DataFrame:
+    """Most recent station_features row per station — model input for next-month inference."""
+    sql = """
+        SELECT DISTINCT ON (unique_scno) *
+        FROM station_features
+        ORDER BY unique_scno, feature_month DESC
+    """
+    with get_conn() as conn:
+        return pd.read_sql(sql, conn)
+
+
+def insert_model_run(metrics: Dict[str, Any]) -> int:
+    """Insert a training run's metrics into model_runs. Returns the new row id."""
+    data = {
+        "model_version":       metrics.get("model_version"),
+        "n_stations":          metrics.get("n_stations"),
+        "n_training_rows":     metrics.get("n_training_rows"),
+        "n_test_rows":         metrics.get("n_test_rows"),
+        "cv_mae":              metrics.get("cv_mae"),
+        "cv_rmse":             metrics.get("cv_rmse"),
+        "cv_mape":             metrics.get("cv_mape"),
+        "test_mae":            metrics.get("test_mae"),
+        "test_rmse":           metrics.get("test_rmse"),
+        "test_mape":           metrics.get("test_mape"),
+        "feature_importances": metrics.get("feature_importances"),
+        "hyperparameters":     metrics.get("hyperparameters"),
+    }
+    result = _upsert(
+        "model_runs", data, conflict_cols=["model_version"], returning="id",
+        jsonb_cols=JSONB_COLS | {"feature_importances", "hyperparameters"},
+    )
+    return int(result)
+
+
+def upsert_prediction(data: Dict[str, Any]) -> None:
+    """Insert or update a model_predictions row, keyed on (unique_scno, prediction_month)."""
+    _upsert("model_predictions", data, conflict_cols=["unique_scno", "prediction_month"], returning=None)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

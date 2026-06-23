@@ -111,13 +111,13 @@ def run_predictions(
     """
     # ── Load model ────────────────────────────────────────────────────────────
     try:
-        model, feature_names, version = load_model(model_version)
+        model, feature_names, categories, version = load_model(model_version)
     except FileNotFoundError:
         if retrain_if_stale:
             log.info("No trained model found — running training first...")
             metrics = run_training()
             version = metrics["model_version"]
-            model, feature_names, version = load_model(version)
+            model, feature_names, categories, version = load_model(version)
         else:
             raise
 
@@ -137,7 +137,7 @@ def run_predictions(
     X_latest_copy = X_latest.copy()
     X_latest_copy[TARGET] = 0   # dummy
 
-    X_inf, _, _ = prepare_features(X_latest_copy)
+    X_inf, _, _ = prepare_features(X_latest_copy, categories=categories)
     # Align to training feature set
     X_inf = X_inf.reindex(columns=feature_names)
 

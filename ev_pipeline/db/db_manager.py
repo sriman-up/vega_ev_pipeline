@@ -201,6 +201,14 @@ def get_monthly_weather(unique_scno: str, weather_month: str) -> Optional[Dict]:
             return dict(row) if row else None
 
 
+def upsert_monthly_weather(weather: Dict[str, Any]) -> None:
+    """Write a freshly-fetched weather_scraper.fetch_monthly_weather() result
+    into the cache (same pattern pipeline.py's _build_station_features uses
+    inline) so the next get_monthly_weather() call for this (scno, month)
+    is a cache hit instead of a live Open-Meteo call."""
+    _upsert("monthly_weather", weather, conflict_cols=["unique_scno", "weather_month"], returning=None)
+
+
 def get_latest_bill_month(unique_scno: str) -> Optional[str]:
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -381,11 +389,18 @@ def get_zone_fleet_mix(zone_band: Optional[str] = None) -> List[Dict]:
 # ML feature matrix / model run / prediction API (used by ml/eda.py, train.py, predict.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_feature_matrix(min_months: int = 1) -> pd.DataFrame:
+def get_feature_matrix(min_months: int = 1, min_months_since_opening: Optional[int] = None) -> pd.DataFrame:
     """
     Load every station_features row for stations that have at least
     `min_months` rows of history. Used for EDA and training, where we need
     the full time series per station rather than just the latest row.
+
+    min_months_since_opening, if set, excludes rows still in their ramp-up
+    window (sf.months_since_opening < min_months_since_opening) — keeps the
+    general/autoregressive model's training set focused on steady-state
+    dynamics, since that's its only production use (ml/predict.py forecasts
+    next month for stations with ongoing real history). Default None keeps
+    today's behavior (no filter) for every other caller.
     """
     sql = """
         SELECT sf.*
@@ -395,10 +410,11 @@ def get_feature_matrix(min_months: int = 1) -> pd.DataFrame:
             GROUP BY unique_scno
             HAVING COUNT(*) >= %s
         )
+        AND (%s IS NULL OR sf.months_since_opening >= %s)
         ORDER BY sf.unique_scno, sf.feature_month
     """
     with get_conn() as conn:
-        return pd.read_sql(sql, conn, params=(min_months,))
+        return pd.read_sql(sql, conn, params=(min_months, min_months_since_opening, min_months_since_opening))
 
 
 def get_latest_feature_vectors() -> pd.DataFrame:
@@ -410,6 +426,63 @@ def get_latest_feature_vectors() -> pd.DataFrame:
     """
     with get_conn() as conn:
         return pd.read_sql(sql, conn)
+
+
+def get_coldstart_training_matrix(min_month: int, max_month: Optional[int] = None) -> pd.DataFrame:
+    """
+    Training data for the cold-start ramp/stabilized models (ml/train_coldstart_*.py).
+
+    Unlike get_feature_matrix(), this re-zeros each station's ramp clock at
+    its first NON-ZERO bill (months_since_active), not supply_date — 74% of
+    stations have a leading run of kwh_units=0 bills before real usage
+    starts (commissioning/admin delay, not ramp-up signal), so those rows
+    are dropped entirely via the first_active join. Target is that exact
+    month's real kWh (mb.kwh_units), not next_month_kwh — there's no
+    "next month" concept for a station with zero billing history; we're
+    predicting the calendar month itself from ramp position + static
+    geo/capacity/competition/calendar traits, deliberately excluding every
+    consumption-history column (those are never available for a genuinely
+    new station — see ml/site_simulator.py's module docstring).
+
+    max_month=None means no upper bound (used to pull all stabilized-phase
+    rows regardless of station age, for the per-calendar-month model).
+    """
+    sql = """
+        WITH first_active AS (
+            SELECT unique_scno, MIN(bill_month) AS first_active_month
+            FROM monthly_bills
+            WHERE kwh_units > 0
+            GROUP BY unique_scno
+        )
+        SELECT
+            sf.unique_scno, sf.feature_month,
+            (DATE_PART('year', sf.feature_month) - DATE_PART('year', fa.first_active_month)) * 12
+              + (DATE_PART('month', sf.feature_month) - DATE_PART('month', fa.first_active_month))
+              AS months_since_active,
+            sf.contracted_load_kva, sf.total_charger_count, sf.total_power_kw, sf.charger_mix_ratio,
+            sf.dist_from_city_a_km, sf.dist_from_city_b_km, sf.dist_from_midpoint_km,
+            sf.highway_position_ratio, sf.direction_side,
+            sf.nearby_ev_stations_1km, sf.nearby_restaurants_1km, sf.nearby_hotels_1km,
+            sf.nearby_petrol_pumps_1km, sf.competition_intensity, sf.amenity_score,
+            sf.has_attached_restaurant, sf.location_type,
+            sf.month_of_year, sf.is_summer, sf.is_monsoon, sf.is_festival_month,
+            sf.avg_temp_c, sf.max_temp_c, sf.total_rainfall_mm, sf.heatwave_days, sf.rainfall_days,
+            mb.kwh_units AS target_kwh
+        FROM station_features sf
+        JOIN monthly_bills mb
+          ON mb.unique_scno = sf.unique_scno AND mb.bill_month = sf.feature_month
+        JOIN first_active fa ON fa.unique_scno = sf.unique_scno
+        WHERE sf.feature_month >= fa.first_active_month
+          AND mb.kwh_units IS NOT NULL
+          AND (DATE_PART('year', sf.feature_month) - DATE_PART('year', fa.first_active_month)) * 12
+              + (DATE_PART('month', sf.feature_month) - DATE_PART('month', fa.first_active_month)) >= %s
+          AND (%s IS NULL OR
+               (DATE_PART('year', sf.feature_month) - DATE_PART('year', fa.first_active_month)) * 12
+               + (DATE_PART('month', sf.feature_month) - DATE_PART('month', fa.first_active_month)) <= %s)
+        ORDER BY sf.unique_scno, sf.feature_month
+    """
+    with get_conn() as conn:
+        return pd.read_sql(sql, conn, params=(min_month, max_month, max_month))
 
 
 def insert_model_run(metrics: Dict[str, Any]) -> int:

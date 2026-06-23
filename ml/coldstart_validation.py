@@ -5,20 +5,32 @@ against real stations' actual billing history.
 
 We can't validate a cold-start prediction against a truly new station — by
 definition there's no ground truth for it yet. So instead: pick N existing
-stations at random, retrain a model that has NEVER seen their data (a real
-generalization test, not just re-scoring rows the model memorized), predict
-each one exactly as if it were brand new (supply_date = its own real first
-bill month, zero billing history, only the static geo/capacity/competition
-features site_simulator.py would have had), and compare that single flat
-"as of opening" prediction against the station's REAL monthly kWh trajectory
-over its whole lifetime.
+stations at random, retrain the cold-start models (ml/train_coldstart_ramp.py
++ ml/train_coldstart_stabilized_single.py / _permonth.py) on every OTHER
+station (a real generalization test, not just re-scoring rows the model
+memorized), predict a full ramp-up TRAJECTORY for each held-out station
+exactly as if it were brand new (supply_date = its own real first NON-ZERO
+bill month — see db_manager.get_coldstart_training_matrix()'s docstring on
+why leading zero-kWh bills are excluded — one cold-start prediction per
+month for the first --horizon-months months), and compare each predicted
+month against the REAL actual for that SAME calendar month — not a single
+flat number compared against the station's entire multi-year lifetime,
+which conflates "month 1" with "steady state" and makes any cold-start
+prediction look wrong by construction.
 
-The holdout model is trained in-memory only (train.py's run_training(save=False))
-and never touches ml/artifacts/ — it can't accidentally become "latest" and
+--compare-families trains and reports BOTH stabilized-stage architectures
+side by side (Family A "single" vs Family B "per-calendar-month" — see
+ml/coldstart_common.py) so you can pick a winner; both share the same
+holdout split and the same ramp-stage model, so the comparison isolates
+just the stabilized-stage design.
+
+All holdout models are trained in-memory only (run_training(save=False))
+and never touch ml/artifacts/ — they can't accidentally become "latest" and
 get served to real predictions.
 
 Usage:
-    python -m ml.coldstart_validation --n 5 --seed 42 --out reports/coldstart_validation.html
+    python -m ml.coldstart_validation --n 5 --seed 42 --horizon-months 12
+    python -m ml.coldstart_validation --n 5 --compare-families
 """
 
 import argparse
@@ -30,9 +42,21 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ev_pipeline.db.db_manager import get_all_stations, get_feature_matrix, get_station_billing_history
-from ev_pipeline.features.feature_builder import build_feature_row
-from ml.site_simulator import _run_inference, fetch_weather_with_fallback
+from ev_pipeline.db.db_manager import get_all_stations, get_coldstart_training_matrix, get_station_billing_history
+from ml.coldstart_common import (
+    COLDSTART_BOOL_FEATURES,
+    COLDSTART_CATEGORICAL_FEATURES,
+    COLDSTART_TARGET,
+    PERMONTH_NUMERIC_FEATURES,
+    RAMP_MAX,
+    RAMP_MIN,
+    RAMP_NUMERIC_FEATURES,
+    STABILIZED_MIN,
+    actual_series,
+    compare_trajectory_to_actuals,
+    month_diff,
+)
+from ml.site_simulator import _run_inference, build_monthly_feature_rows
 from ml.train import run_training
 
 log = logging.getLogger(__name__)
@@ -47,6 +71,8 @@ except ImportError:
     log.warning("matplotlib not installed — plots will be skipped in the report")
 
 DEFAULT_MIN_MONTHS = 6
+FAMILY_LABELS = {"single": "Family A (single)", "permonth": "Family B (per-calendar-month)"}
+FAMILY_COLORS = {"single": "#e74c3c", "permonth": "#27ae60"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -77,79 +103,122 @@ def select_holdout_stations(n: int, seed: int, min_months: int = DEFAULT_MIN_MON
     return selected
 
 
-def train_holdout_model(excluded_scnos: List[str]) -> Tuple[Any, List[str]]:
+def _train_one(df, numeric_features) -> Dict[str, Any]:
+    metrics = run_training(
+        df=df, target=COLDSTART_TARGET,
+        numeric_features=numeric_features, bool_features=COLDSTART_BOOL_FEATURES,
+        categorical_features=COLDSTART_CATEGORICAL_FEATURES,
+        run_shap=False, save=False, log_to_db=False, compute_thresholds=False,
+    )
+    return {"model": metrics["_model"], "feature_names": metrics["_feature_names"], "categories": metrics["_categories"]}
+
+
+def train_holdout_coldstart_models(excluded_scnos: List[str], family: str = "single") -> Dict[str, Any]:
     """
-    Retrain on every station EXCEPT the held-out ones. save=False/log_to_db=False
-    — this model only ever lives in memory for this validation run.
+    Retrain the shared ramp model plus the requested stabilized-stage
+    family(ies), excluding the held-out stations. Returns:
+        {"ramp": {...}, "single": {...}?, "permonth": {cal_month: {...}}?}
+    Each {...} is {"model", "feature_names", "categories"}. Pass
+    family="both" to train both stabilized families for --compare-families.
     """
-    df = get_feature_matrix(min_months=3)
-    df = df[~df["unique_scno"].isin(excluded_scnos)].copy()
-    log.info("Training holdout model on %d rows from %d stations (excluding %d held out)",
-              len(df), df["unique_scno"].nunique(), len(excluded_scnos))
-    metrics = run_training(df=df, run_shap=False, save=False, log_to_db=False)
-    return metrics["_model"], metrics["_feature_names"]
+    ramp_df = get_coldstart_training_matrix(RAMP_MIN, RAMP_MAX)
+    ramp_df = ramp_df[~ramp_df["unique_scno"].isin(excluded_scnos)].copy()
+    log.info("Training holdout ramp model on %d rows from %d stations (excluding %d held out)",
+              len(ramp_df), ramp_df["unique_scno"].nunique(), len(excluded_scnos))
+    holdout: Dict[str, Any] = {"ramp": _train_one(ramp_df, RAMP_NUMERIC_FEATURES)}
+
+    families = ("single", "permonth") if family == "both" else (family,)
+
+    if "single" in families:
+        single_df = get_coldstart_training_matrix(STABILIZED_MIN, None)
+        single_df = single_df[~single_df["unique_scno"].isin(excluded_scnos)].copy()
+        log.info("Training holdout Family A stabilized model on %d rows from %d stations",
+                  len(single_df), single_df["unique_scno"].nunique())
+        holdout["single"] = _train_one(single_df, RAMP_NUMERIC_FEATURES)
+
+    if "permonth" in families:
+        permonth_df = get_coldstart_training_matrix(STABILIZED_MIN, None)
+        permonth_df = permonth_df[~permonth_df["unique_scno"].isin(excluded_scnos)].copy()
+        log.info("Training holdout Family B per-calendar-month models on %d total rows from %d stations",
+                  len(permonth_df), permonth_df["unique_scno"].nunique())
+        permonth: Dict[int, Dict[str, Any]] = {}
+        for cal_month in range(1, 13):
+            sub = permonth_df[permonth_df["month_of_year"] == cal_month]
+            if sub.empty:
+                continue
+            permonth[cal_month] = _train_one(sub, PERMONTH_NUMERIC_FEATURES)
+        holdout["permonth"] = permonth
+
+    return holdout
+
+
+def _resolve_holdout_model(
+    holdout_models: Dict[str, Any],
+    months_since_active: int,
+    feature_month: str,
+    family: str,
+) -> Tuple[Any, List[str], Dict[str, List[str]], List[str]]:
+    """In-memory mirror of ml.site_simulator._pick_coldstart_model() —
+    same selection logic, against holdout-trained models instead of disk."""
+    if months_since_active <= RAMP_MAX:
+        entry = holdout_models["ramp"]
+        return entry["model"], entry["feature_names"], entry["categories"], RAMP_NUMERIC_FEATURES
+    if family == "single":
+        entry = holdout_models["single"]
+        return entry["model"], entry["feature_names"], entry["categories"], RAMP_NUMERIC_FEATURES
+    cal_month = int(feature_month[5:7])
+    entry = holdout_models["permonth"][cal_month]
+    return entry["model"], entry["feature_names"], entry["categories"], PERMONTH_NUMERIC_FEATURES
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Cold-start prediction for a real (existing) station
+# Cold-start trajectory for a real (existing) station
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_coldstart_prediction(station: Dict[str, Any], model, feature_names: List[str]) -> Dict[str, Any]:
+def build_coldstart_trajectory(
+    station: Dict[str, Any],
+    holdout_models: Dict[str, Any],
+    start_month: str,
+    horizon_months: int = 12,
+    family: str = "single",
+) -> List[Dict[str, Any]]:
     """
-    Predict this real station's performance exactly as site_simulator.py
-    would for a brand-new site — but reusing its already-stored geo/
-    competition/zone fields directly (no live Places re-fetch needed; this
-    station already exists, so that data is real, not hypothetical) and
-    overriding supply_date to its own real first bill month so
-    months_since_opening=0 / is_ramp_up_phase=True, matching what a true
-    "predict before I have any history" call would have looked like.
+    Predict this real station's performance for each of its first
+    horizon_months months exactly as site_simulator.py would for a brand-new
+    site — reusing its already-stored geo/competition/zone fields directly
+    (no live Places re-fetch needed; this station already exists, so that
+    data is real, not hypothetical) and overriding supply_date to its own
+    first real (non-zero-bill) month so months_since_active increments
+    naturally, matching what a true "predict before I have any history"
+    call sequence would have looked like. See
+    ml.site_simulator.build_monthly_feature_rows().
     """
-    history = station.get("_history") or get_station_billing_history(station["unique_scno"])
-    first_bill_month = str(history[0]["bill_month"])[:10]
-
-    candidate = dict(station)
-    candidate["supply_date"] = first_bill_month
-
-    weather = None
-    if station.get("latitude") and station.get("longitude"):
-        weather, _ = fetch_weather_with_fallback(station["latitude"], station["longitude"], first_bill_month)
-
-    feature_row = build_feature_row(candidate, history=[], weather=weather, feature_month=first_bill_month)
-    inference = _run_inference(feature_row, model, feature_names, quantile_models=None)
-    return {**inference, "feature_month": first_bill_month}
+    feature_rows = build_monthly_feature_rows(
+        station, start_month, horizon_months, cache_scno=station["unique_scno"],
+    )
+    trajectory = []
+    for row in feature_rows:
+        model, feature_names, categories, numeric_features = _resolve_holdout_model(
+            holdout_models, row["months_since_active"], row["feature_month"], family,
+        )
+        inference = _run_inference(
+            row, model, feature_names, categories=categories,
+            quantile_models=None, numeric_features=numeric_features,
+        )
+        trajectory.append({
+            "feature_month": row["feature_month"],
+            "months_since_active": row.get("months_since_active"),
+            **inference,
+        })
+    return trajectory
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Comparison against the real trajectory
+# Comparison against the real trajectory — actual_series()/
+# compare_trajectory_to_actuals() now live in ml.coldstart_common, shared
+# with ml.site_simulator.predict_existing_station_trajectory()'s live
+# "test prediction" API path so both compare the exact same way.
 # ─────────────────────────────────────────────────────────────────────────────
-
-def actual_series(history: List[Dict[str, Any]]) -> List[Tuple[str, float]]:
-    series = [
-        (str(r["bill_month"])[:10], float(r.get("kwh_units") or r.get("billed_units") or 0))
-        for r in history if r.get("bill_month")
-    ]
-    return sorted(series)
-
-
-def compare_to_actuals(history: List[Dict[str, Any]], predicted_kwh: float) -> Dict[str, Any]:
-    series = actual_series(history)
-    values = [v for _, v in series]
-
-    def pct_err(actual: Optional[float]) -> Optional[float]:
-        if actual is None or actual == 0:
-            return None
-        return round(100 * (predicted_kwh - actual) / actual, 1)
-
-    month1 = values[0] if values else None
-    avg_3mo = float(np.mean(values[:3])) if values else None
-    avg_lifetime = float(np.mean(values)) if values else None
-
-    return {
-        "month1_actual": month1, "month1_pct_error": pct_err(month1),
-        "avg_3mo_actual": round(avg_3mo, 1) if avg_3mo is not None else None, "avg_3mo_pct_error": pct_err(avg_3mo),
-        "avg_lifetime_actual": round(avg_lifetime, 1) if avg_lifetime is not None else None, "avg_lifetime_pct_error": pct_err(avg_lifetime),
-        "n_months": len(values),
-    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -164,19 +233,36 @@ def _fig_to_b64(fig) -> str:
     return base64.b64encode(buf.read()).decode()
 
 
-def plot_station(scno: str, station_name: Optional[str], series: List[Tuple[str, float]], prediction: Dict[str, Any]) -> str:
+def plot_station(
+    scno: str,
+    station_name: Optional[str],
+    series: List[Tuple[str, float]],
+    trajectories: Dict[str, List[Dict[str, Any]]],
+) -> str:
     if not _HAS_MPL:
         return ""
     import pandas as pd
-    months = [pd.Timestamp(m) for m, _ in series]
-    values = [v for _, v in series]
+    actual_months = [pd.Timestamp(m) for m, _ in series]
+    actual_values = [v for _, v in series]
 
     fig, ax = plt.subplots(figsize=(9, 3.5))
-    ax.plot(months, values, marker="o", markersize=4, linewidth=1.5, color="#3498db", label="Actual kWh")
-    ax.axhline(prediction["predicted_kwh"], color="#e74c3c", linestyle="--", linewidth=1.5,
-               label=f"Cold-start prediction ({prediction['predicted_kwh']:.0f} kWh)")
-    ax.axhspan(prediction["predicted_kwh_lower"], prediction["predicted_kwh_upper"], color="#e74c3c", alpha=0.1)
-    ax.set_title(f"{station_name or scno} ({scno[-6:]}) — predicted as of {prediction['feature_month'][:7]}")
+    ax.plot(actual_months, actual_values, marker="o", markersize=4, linewidth=1.5, color="#3498db", label="Actual kWh")
+
+    horizon = 0
+    first_month = None
+    for family, trajectory in trajectories.items():
+        pred_months = [pd.Timestamp(step["feature_month"]) for step in trajectory]
+        pred_values = [step["predicted_kwh"] for step in trajectory]
+        pred_lower = [step["predicted_kwh_lower"] for step in trajectory]
+        pred_upper = [step["predicted_kwh_upper"] for step in trajectory]
+        color = FAMILY_COLORS.get(family, "#999999")
+        ax.plot(pred_months, pred_values, marker="s", markersize=4, linewidth=1.5, linestyle="--",
+                color=color, label=FAMILY_LABELS.get(family, family))
+        ax.fill_between(pred_months, pred_lower, pred_upper, color=color, alpha=0.10)
+        horizon = max(horizon, len(trajectory))
+        first_month = first_month or trajectory[0]["feature_month"][:7]
+
+    ax.set_title(f"{station_name or scno} ({scno[-6:]}) — {horizon}-month cold-start forecast from {first_month}")
     ax.set_ylabel("kWh")
     ax.legend(fontsize=8)
     fig.tight_layout()
@@ -195,14 +281,20 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   th {{ background: #ecf0f1; }} td:first-child, th:first-child {{ text-align: left; }}
   .card {{ background: white; padding: 14px; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); margin: 16px 0; }}
   .note {{ background: #fef9e7; border-left: 4px solid #f39c12; padding: 10px 14px; border-radius: 4px; font-size: 13px; }}
+  .subtable {{ margin-top: 8px; }}
 </style></head><body>
 <h1>Cold-Start Validation Report</h1>
-<p style="color:#7f8c8d">Generated {generated_at} — holdout model trained on {n_train_rows} rows from {n_train_stations} stations, excluding the {n_holdout} held-out stations below.</p>
-<div class="note">Each station's prediction uses ONLY static geo/capacity/competition features
-and its own real opening month — no billing history, exactly as ml/site_simulator.py would
-treat a brand-new site. pct_error = (predicted - actual) / actual * 100.</div>
+<p style="color:#7f8c8d">Generated {generated_at} — shared ramp model trained on {n_ramp_rows} rows from
+{n_ramp_stations} stations, excluding the {n_holdout} held-out stations below.</p>
+<div class="note">Each station gets a predicted trajectory spanning its own full available billing history
+(up to {horizon_months} months in this report) using ONLY static geo/capacity/competition features and its
+own first real (non-zero-bill) month — no billing history, exactly as ml/site_simulator.py would treat a
+brand-new site. Months 0-{ramp_max} use the shared ramp model; months {stabilized_min}+ use the
+stabilized-stage model(s) below. Each predicted month is compared against the REAL actual for that SAME
+calendar month. pct_error = (predicted - actual) / actual * 100; MAPE = mean absolute pct_error over the
+months that have both a prediction and a real (non-zero) actual.</div>
 
-<h2>Aggregate error (mean abs % error across {n_holdout} stations)</h2>
+<h2>Aggregate error (MAPE across {n_holdout} stations)</h2>
 {aggregate_table}
 
 <h2>Per-station detail</h2>
@@ -212,39 +304,65 @@ treat a brand-new site. pct_error = (predicted - actual) / actual * 100.</div>
 </body></html>"""
 
 
-def _aggregate_table(results: List[Dict[str, Any]]) -> str:
+def _aggregate_table(results: List[Dict[str, Any]], families: Tuple[str, ...]) -> str:
     rows = []
-    for key, label in [("month1_pct_error", "vs month-1 actual"),
-                        ("avg_3mo_pct_error", "vs first-3-month avg"),
-                        ("avg_lifetime_pct_error", "vs lifetime avg")]:
-        errs = [abs(r["comparison"][key]) for r in results if r["comparison"].get(key) is not None]
-        mape = f"{np.mean(errs):.1f}%" if errs else "n/a"
-        rows.append(f"<tr><td>{label}</td><td>{mape}</td><td>{len(errs)}/{len(results)} stations</td></tr>")
-    return ("<table><tr><th>Comparison point</th><th>Mean abs % error</th><th>Coverage</th></tr>"
-            + "".join(rows) + "</table>")
+    overall_mapes = {fam: [] for fam in families}
+    header = "<th>Station</th>" + "".join(f"<th>{FAMILY_LABELS[fam]} MAPE</th>" for fam in families) + "<th>Months matched</th>"
+    for r in results:
+        name = r["station"].get("station_name") or r["station"]["unique_scno"]
+        cells = []
+        n_matched = None
+        for fam in families:
+            cmp_ = r["comparisons"][fam]
+            n_matched = cmp_["n_matched"]
+            if cmp_["mape"] is not None:
+                overall_mapes[fam].append(cmp_["mape"])
+                cells.append(f"<td>{cmp_['mape']:.1f}%</td>")
+            else:
+                cells.append("<td>n/a</td>")
+        rows.append(f"<tr><td>{name}</td>{''.join(cells)}<td>{n_matched}</td></tr>")
+
+    summary_cells = []
+    for fam in families:
+        vals = overall_mapes[fam]
+        summary_cells.append(f"{FAMILY_LABELS[fam]}: {np.mean(vals):.1f}%" if vals else f"{FAMILY_LABELS[fam]}: n/a")
+    summary = "<p><b>Overall mean MAPE — " + " | ".join(summary_cells) + f" (across {len(results)} stations)</b></p>"
+
+    table = f"<table><tr>{header}</tr>" + "".join(rows) + "</table>"
+    return summary + table
 
 
-def _station_card(result: Dict[str, Any]) -> str:
-    s, pred, cmp_ = result["station"], result["prediction"], result["comparison"]
+def _station_card(result: Dict[str, Any], families: Tuple[str, ...]) -> str:
     img = f'<img src="data:image/png;base64,{result["plot"]}" style="width:100%;max-width:850px">' if result["plot"] else ""
+    summary = " | ".join(
+        f"{FAMILY_LABELS[fam]} MAPE {result['comparisons'][fam]['mape']:.1f}%"
+        if result["comparisons"][fam]["mape"] is not None else f"{FAMILY_LABELS[fam]} MAPE n/a"
+        for fam in families
+    )
+    n_matched = next(iter(result["comparisons"].values()))["n_matched"]
+
+    subtables = ""
+    for fam in families:
+        cmp_ = result["comparisons"][fam]
+        row_html = "".join(
+            f"<tr><td>{r['feature_month']}</td><td>{r['months_since_active']}</td>"
+            f"<td>{r['predicted_kwh']:.0f}</td><td>{r['predicted_kwh_lower']:.0f}-{r['predicted_kwh_upper']:.0f}</td>"
+            f"<td>{r['actual_kwh'] if r['actual_kwh'] is not None else 'n/a'}</td>"
+            f"<td>{r['pct_error'] if r['pct_error'] is not None else 'n/a'}{'%' if r['pct_error'] is not None else ''}</td></tr>"
+            for r in cmp_["rows"]
+        )
+        subtables += f"""
+  <table class="subtable">
+    <caption style="text-align:left;font-weight:bold;margin-bottom:4px">{FAMILY_LABELS[fam]}</caption>
+    <tr><th>Month</th><th>Months active</th><th>Predicted kWh</th><th>Range</th><th>Actual kWh</th><th>% error</th></tr>
+    {row_html}
+  </table>"""
+
     return f"""
 <div class="card">
+  <h3>{result['station'].get('station_name') or result['station']['unique_scno']} — {summary} ({n_matched} months matched)</h3>
   {img}
-  <table>
-    <tr><th>predicted_kwh</th><th>range</th><th>month-1 actual</th><th>err</th>
-        <th>3mo avg actual</th><th>err</th><th>lifetime avg actual</th><th>err</th><th>months of data</th></tr>
-    <tr>
-      <td>{pred['predicted_kwh']:.0f}</td>
-      <td>{pred['predicted_kwh_lower']:.0f}-{pred['predicted_kwh_upper']:.0f}</td>
-      <td>{cmp_['month1_actual'] if cmp_['month1_actual'] is not None else 'n/a'}</td>
-      <td>{cmp_['month1_pct_error']}%</td>
-      <td>{cmp_['avg_3mo_actual'] if cmp_['avg_3mo_actual'] is not None else 'n/a'}</td>
-      <td>{cmp_['avg_3mo_pct_error']}%</td>
-      <td>{cmp_['avg_lifetime_actual'] if cmp_['avg_lifetime_actual'] is not None else 'n/a'}</td>
-      <td>{cmp_['avg_lifetime_pct_error']}%</td>
-      <td>{cmp_['n_months']}</td>
-    </tr>
-  </table>
+  {subtables}
 </div>"""
 
 
@@ -252,7 +370,27 @@ def _station_card(result: Dict[str, Any]) -> str:
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_validation(n: int = 5, seed: int = 42, min_months: int = DEFAULT_MIN_MONTHS, out: str = "reports/coldstart_validation.html"):
+def run_validation(
+    n: int = 5,
+    seed: int = 42,
+    min_months: int = DEFAULT_MIN_MONTHS,
+    horizon_months: Optional[int] = None,
+    family: str = "single",
+    compare_families: bool = False,
+    out: str = "reports/coldstart_validation.html",
+):
+    """
+    horizon_months: cap on how many months to predict forward per station.
+    None (default) predicts each station's own FULL available billing
+    history span (e.g. a station with 28 months of real bills gets a
+    28-month trajectory) — the fairest test of how far the cold-start
+    models' ramp/stabilized design actually holds up, since it's not
+    artificially truncated at some fixed number. Both stabilized-stage
+    families (ml/train_coldstart_stabilized_single.py and
+    ml/train_coldstart_stabilized_permonth.py) are trained on unbounded
+    months_since_active >= 6, so neither is extrapolating outside its
+    training range regardless of how long a station's history is.
+    """
     from datetime import datetime
     from pathlib import Path
 
@@ -261,30 +399,48 @@ def run_validation(n: int = 5, seed: int = 42, min_months: int = DEFAULT_MIN_MON
         log.error("No stations with >= %d months of history found — nothing to validate.", min_months)
         return
 
+    families: Tuple[str, ...] = ("single", "permonth") if compare_families else (family,)
     excluded = [s["unique_scno"] for s in holdout_stations]
-    model, feature_names = train_holdout_model(excluded)
+    holdout_models = train_holdout_coldstart_models(excluded, family="both" if compare_families else family)
 
-    full_df = get_feature_matrix(min_months=3)
-    n_train_rows = len(full_df[~full_df["unique_scno"].isin(excluded)])
-    n_train_stations = full_df[~full_df["unique_scno"].isin(excluded)]["unique_scno"].nunique()
+    ramp_df = get_coldstart_training_matrix(RAMP_MIN, RAMP_MAX)
+    ramp_df = ramp_df[~ramp_df["unique_scno"].isin(excluded)]
+    n_ramp_rows, n_ramp_stations = len(ramp_df), ramp_df["unique_scno"].nunique()
 
     results = []
+    max_horizon_used = 0
     for station in holdout_stations:
         scno = station["unique_scno"]
-        history = station["_history"]
-        prediction = build_coldstart_prediction(station, model, feature_names)
-        comparison = compare_to_actuals(history, prediction["predicted_kwh"])
-        plot = plot_station(scno, station.get("station_name"), actual_series(history), prediction)
-        results.append({"station": station, "prediction": prediction, "comparison": comparison, "plot": plot})
-        log.info("SCNo %s: predicted=%.0f kWh, month1_actual=%s (err %s%%), lifetime_avg_actual=%s (err %s%%)",
-                  scno, prediction["predicted_kwh"], comparison["month1_actual"], comparison["month1_pct_error"],
-                  comparison["avg_lifetime_actual"], comparison["avg_lifetime_pct_error"])
+        series = actual_series(station["_history"])
+        if not series:
+            log.warning("SCNo %s has no non-zero billing history — skipping", scno)
+            continue
+        start_month = series[0][0][:7] + "-01"
+        full_span = month_diff(series[0][0][:7], series[-1][0][:7])
+        station_horizon = full_span if horizon_months is None else min(full_span, horizon_months)
+        max_horizon_used = max(max_horizon_used, station_horizon)
+
+        comparisons = {}
+        trajectories = {}
+        for fam in families:
+            trajectory = build_coldstart_trajectory(
+                station, holdout_models, start_month=start_month,
+                horizon_months=station_horizon, family=fam,
+            )
+            comparisons[fam] = compare_trajectory_to_actuals(series, trajectory)
+            trajectories[fam] = trajectory
+            log.info("SCNo %s [%s]: %d-month trajectory (station has %d months of data), MAPE=%s%% over %d matched months",
+                      scno, fam, station_horizon, full_span, comparisons[fam]["mape"], comparisons[fam]["n_matched"])
+
+        plot = plot_station(scno, station.get("station_name"), series, trajectories)
+        results.append({"station": station, "comparisons": comparisons, "plot": plot})
 
     html = _HTML_TEMPLATE.format(
         generated_at=datetime.now().strftime("%Y-%m-%d %H:%M"),
-        n_train_rows=n_train_rows, n_train_stations=n_train_stations, n_holdout=len(results),
-        aggregate_table=_aggregate_table(results),
-        station_cards="".join(_station_card(r) for r in results),
+        n_ramp_rows=n_ramp_rows, n_ramp_stations=n_ramp_stations, n_holdout=len(results),
+        horizon_months=max_horizon_used, ramp_max=RAMP_MAX, stabilized_min=STABILIZED_MIN,
+        aggregate_table=_aggregate_table(results, families),
+        station_cards="".join(_station_card(r, families) for r in results),
     )
     out_path = Path(out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -304,7 +460,18 @@ if __name__ == "__main__":
     parser.add_argument("--n", type=int, default=5, help="Number of stations to hold out")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--min-months", type=int, default=DEFAULT_MIN_MONTHS)
+    parser.add_argument("--horizon-months", type=int, default=None,
+                        help="Cap on months to predict forward per station (default: each station's "
+                             "own full available billing history span, uncapped)")
+    parser.add_argument("--family", choices=("single", "permonth"), default="single",
+                        help="Stabilized-stage architecture to use when not comparing both")
+    parser.add_argument("--compare-families", action="store_true",
+                        help="Train and report both Family A and Family B side by side")
     parser.add_argument("--out", default="reports/coldstart_validation.html")
     args = parser.parse_args()
 
-    run_validation(n=args.n, seed=args.seed, min_months=args.min_months, out=args.out)
+    run_validation(
+        n=args.n, seed=args.seed, min_months=args.min_months,
+        horizon_months=args.horizon_months, family=args.family,
+        compare_families=args.compare_families, out=args.out,
+    )

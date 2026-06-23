@@ -43,15 +43,23 @@ def compute_competition_features(
     feats: Dict[str, Any] = {}
 
     # ── Direct counts from Places enrichment ─────────────────────────────────
-    nearby_ev   = station.get("nearby_ev_stations_1km")
-    nearby_rest = station.get("nearby_restaurants_1km")
-    has_rest    = station.get("has_attached_restaurant", False)
-    rating      = station.get("places_rating")
+    nearby_ev     = station.get("nearby_ev_stations_1km")
+    nearby_rest   = station.get("nearby_restaurants_1km")
+    nearby_hotels = station.get("nearby_hotels_1km")
+    nearby_petrol = station.get("nearby_petrol_pumps_1km")
+    nearby_shop   = station.get("nearby_shopping_1km")
+    has_rest      = station.get("has_attached_restaurant", False)
+    rating        = station.get("places_rating")
+    rating_count  = station.get("places_user_ratings_total")
 
-    feats["nearby_ev_stations_1km"]   = nearby_ev   if nearby_ev   is not None else 0
-    feats["nearby_restaurants_1km"]   = nearby_rest if nearby_rest is not None else 0
+    feats["nearby_ev_stations_1km"]   = nearby_ev     if nearby_ev     is not None else 0
+    feats["nearby_restaurants_1km"]   = nearby_rest   if nearby_rest   is not None else 0
+    feats["nearby_hotels_1km"]        = nearby_hotels if nearby_hotels is not None else 0
+    feats["nearby_petrol_pumps_1km"]  = nearby_petrol if nearby_petrol is not None else 0
+    feats["nearby_shopping_1km"]      = nearby_shop   if nearby_shop   is not None else 0
     feats["has_attached_restaurant"]  = bool(has_rest)
     feats["places_rating"]            = rating
+    feats["places_user_ratings_total"] = rating_count
 
     # ── Competition intensity score (0–1 normalised, higher = more competition) ──
     # Heuristic: each nearby EV station within 1 km is a direct competitor.

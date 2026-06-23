@@ -38,7 +38,7 @@ import pickle
 import warnings
 from datetime import datetime, date
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -119,22 +119,66 @@ LOG_TARGET = "log_next_month_kwh"   # training uses log(1+kwh)
 # Data preparation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def prepare_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, List[str]]:
+def prepare_features(
+    df: pd.DataFrame,
+    categories: Optional[Dict[str, List[str]]] = None,
+    numeric_features: Optional[List[str]] = None,
+    bool_features: Optional[List[str]] = None,
+    categorical_features: Optional[List[str]] = None,
+    target: Optional[str] = None,
+) -> Tuple[pd.DataFrame, pd.Series, List[str]]:
     """
     Clean and encode the feature matrix.
     Returns (X, y, feature_names).
+
+    categories: fixed {column: [category, ...]} vocabulary for categorical_features,
+    as returned by extract_categories(). LightGBM's Booster remembers the exact
+    category vocabulary it was fit on and rejects predict-time data whose pandas
+    category dtype has a different vocabulary — even if every value is one it's
+    seen before. Pandas infers a column's categories from whatever rows are
+    present, so re-inferring per call (e.g. a single-row inference DataFrame
+    naturally has only one category per column) silently produces a different
+    vocabulary than training used. Always pass the vocabulary saved with the
+    model for every call except the one used to build it for the first time.
+
+    numeric_features/bool_features/categorical_features/target default to this
+    module's NUMERIC_FEATURES/BOOL_FEATURES/CATEGORICAL_FEATURES/TARGET — the
+    overrides exist so ml/train_coldstart_*.py can reuse this same pipeline
+    with a different (history-free) feature set and a different target column.
     """
+    numeric_features = numeric_features if numeric_features is not None else NUMERIC_FEATURES
+    bool_features = bool_features if bool_features is not None else BOOL_FEATURES
+    categorical_features = categorical_features if categorical_features is not None else CATEGORICAL_FEATURES
+    target = target if target is not None else TARGET
+
     df = df.copy()
     df = df.sort_values(["unique_scno", "feature_month"]).reset_index(drop=True)
 
+    # Numeric → float, explicitly. A column that's all-NULL for every row read
+    # via pd.read_sql on a raw psycopg2 connection (no SQLAlchemy type info)
+    # comes back as object dtype rather than float64 — LightGBM's dtype check
+    # rejects object columns outright even though every value is just missing.
+    for c in numeric_features:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
     # Bool → int
-    for c in BOOL_FEATURES:
+    for c in bool_features:
         if c in df.columns:
             df[c] = df[c].astype(float)
 
-    # Categorical → LightGBM category dtype
-    for c in CATEGORICAL_FEATURES:
-        if c in df.columns:
+    # Categorical → LightGBM category dtype (see categories= docstring above).
+    # When a fixed vocabulary is given, materialize the column even if it's
+    # entirely absent from df (e.g. build_feature_row's remove_none() strips
+    # location_type/direction_side whenever they're None — common for
+    # cold-start stations or off-highway sites). A column reindex() has to
+    # invent from scratch gets plain NaN with no category dtype attached,
+    # which LightGBM rejects as a structural mismatch, not just a missing value.
+    for c in categorical_features:
+        if categories and c in categories:
+            values = df[c] if c in df.columns else pd.Series([None] * len(df), index=df.index)
+            df[c] = values.fillna("unknown").astype(pd.CategoricalDtype(categories=categories[c]))
+        elif c in df.columns:
             df[c] = df[c].fillna("unknown").astype("category")
 
     # Cyclical month encoding (sin/cos) — better than raw 1-12
@@ -143,25 +187,33 @@ def prepare_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, List[st
         df["month_cos"] = np.cos(2 * np.pi * df["month_of_year"] / 12)
 
     all_features = (
-        [c for c in NUMERIC_FEATURES if c in df.columns and c != "month_of_year"]
+        [c for c in numeric_features if c in df.columns and c != "month_of_year"]
         + (["month_sin", "month_cos"] if "month_sin" in df.columns else [])
-        + [c for c in BOOL_FEATURES if c in df.columns]
-        + [c for c in CATEGORICAL_FEATURES if c in df.columns]
+        + [c for c in bool_features if c in df.columns]
+        + [c for c in categorical_features if c in df.columns]
     )
 
     X = df[all_features]
-    y = np.log1p(df[TARGET].astype(float))   # log(1+x) transform
+    y = np.log1p(df[target].astype(float))   # log(1+x) transform
 
     log.info("Feature matrix: %d rows x %d features", len(X), len(all_features))
     log.info("Features used: %s", all_features)
 
     # Warn about low-variance features (may indicate missing data)
-    low_var = [c for c in NUMERIC_FEATURES if c in X.columns
+    low_var = [c for c in numeric_features if c in X.columns
                and X[c].std(skipna=True) < 1e-6]
     if low_var:
         log.warning("Near-zero variance features (check for data issues): %s", low_var)
 
     return X, y, all_features
+
+
+def extract_categories(X: pd.DataFrame) -> Dict[str, List[str]]:
+    """Category vocabulary actually used to build X — save this with the model."""
+    return {
+        c: X[c].cat.categories.tolist()
+        for c in CATEGORICAL_FEATURES if c in X.columns and hasattr(X[c], "cat")
+    }
 
 
 def time_split(df: pd.DataFrame, test_frac: float = 0.2):
@@ -260,6 +312,23 @@ def train_final_model(
     return model
 
 
+def train_quantile_pair(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+) -> Tuple["lgb.LGBMRegressor", "lgb.LGBMRegressor"]:
+    """10th/90th percentile siblings of the main model, for honest prediction
+    intervals instead of a flat +/-% guess — same X_train/y_train (log
+    space) as the main model, quantile objective instead of MAE."""
+    q10_params = {**LGBM_PARAMS, "objective": "quantile", "alpha": 0.10}
+    q90_params = {**LGBM_PARAMS, "objective": "quantile", "alpha": 0.90}
+    q10 = lgb.LGBMRegressor(**q10_params)
+    q90 = lgb.LGBMRegressor(**q90_params)
+    q10.fit(X_train, y_train)
+    q90.fit(X_train, y_train)
+    log.info("Quantile models (p10/p90) trained on %d rows", len(X_train))
+    return q10, q90
+
+
 def evaluate_test(
     model: lgb.LGBMRegressor,
     X_test: pd.DataFrame,
@@ -318,7 +387,7 @@ def compute_shap(
 # Low performer threshold
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_low_performer_thresholds(df: pd.DataFrame) -> Dict[str, float]:
+def compute_low_performer_thresholds(df: pd.DataFrame, target: Optional[str] = None) -> Dict[str, float]:
     """
     Per-station low performer threshold = 40th percentile of that station's
     own historical kWh.
@@ -327,9 +396,10 @@ def compute_low_performer_thresholds(df: pd.DataFrame) -> Dict[str, float]:
     fact that a rural station doing 200 kWh/month is very different from a
     highway station doing 5000 kWh/month.
     """
+    target = target if target is not None else TARGET
     thresholds = {}
     for scno, grp in df.groupby("unique_scno"):
-        vals = grp[TARGET].dropna()
+        vals = grp[target].dropna()
         thresholds[scno] = float(vals.quantile(0.40)) if len(vals) >= 3 else float(vals.median())
     return thresholds
 
@@ -359,27 +429,80 @@ def flag_low_performers(
 # Persistence
 # ─────────────────────────────────────────────────────────────────────────────
 
-def save_model(model, feature_names: List[str], version: str) -> Path:
-    path = MODEL_DIR / f"lgbm_{version}.pkl"
+def save_model(
+    model,
+    feature_names: List[str],
+    version: str,
+    categories: Optional[Dict[str, List[str]]] = None,
+    model_name: str = "lgbm",
+) -> Path:
+    """model_name sets the file prefix ({model_name}_{version}.pkl) — lets
+    ml/train_coldstart_*.py share this persistence helper without colliding
+    with the general model's "latest" resolution below."""
+    path = MODEL_DIR / f"{model_name}_{version}.pkl"
     with open(path, "wb") as f:
         pickle.dump({"model": model, "feature_names": feature_names,
+                     "categories": categories or {},
                      "version": version, "trained_at": datetime.utcnow().isoformat()}, f)
     log.info("Model saved to %s", path)
     return path
 
 
-def load_model(version: str = "latest") -> Tuple:
+def load_model(version: str = "latest", model_name: str = "lgbm") -> Tuple:
+    """Returns (model, feature_names, categories, version)."""
     if version == "latest":
-        paths = sorted(MODEL_DIR.glob("lgbm_*.pkl"))
+        # Exclude the {model_name}_q10_*.pkl / {model_name}_q90_*.pkl quantile
+        # siblings (see save_quantile_models()) — they match this same glob
+        # but are bare LGBMRegressor pickles, not save_model()'s dict format.
+        paths = sorted(
+            p for p in MODEL_DIR.glob(f"{model_name}_*.pkl")
+            if "_q10_" not in p.name and "_q90_" not in p.name
+        )
         if not paths:
-            raise FileNotFoundError(f"No model found in {MODEL_DIR}")
+            raise FileNotFoundError(f"No model found in {MODEL_DIR} matching {model_name}_*.pkl")
         path = paths[-1]
     else:
-        path = MODEL_DIR / f"lgbm_{version}.pkl"
+        path = MODEL_DIR / f"{model_name}_{version}.pkl"
     with open(path, "rb") as f:
         obj = pickle.load(f)
     log.info("Loaded model version %s from %s", obj["version"], path)
-    return obj["model"], obj["feature_names"], obj["version"]
+    return obj["model"], obj["feature_names"], obj.get("categories", {}), obj["version"]
+
+
+def save_quantile_models(q10, q90, version: str, model_name: str = "lgbm") -> Tuple[Path, Path]:
+    """Sibling files to save_model()'s {model_name}_{version}.pkl —
+    {model_name}_q10_{version}.pkl / {model_name}_q90_{version}.pkl."""
+    lower_path = MODEL_DIR / f"{model_name}_q10_{version}.pkl"
+    upper_path = MODEL_DIR / f"{model_name}_q90_{version}.pkl"
+    with open(lower_path, "wb") as f:
+        pickle.dump(q10, f)
+    with open(upper_path, "wb") as f:
+        pickle.dump(q90, f)
+    log.info("Quantile models saved to %s / %s", lower_path, upper_path)
+    return lower_path, upper_path
+
+
+def load_quantile_models(version: str = "latest", model_name: str = "lgbm") -> Tuple[Optional[Any], Optional[Any]]:
+    """Returns (q10_model, q90_model), or (None, None) if this model_name
+    has no trained quantile siblings yet — callers should fall back to a
+    rough +/-% CI in that case (see ml/site_simulator.py's _run_inference())."""
+    try:
+        if version == "latest":
+            lower_paths = sorted(MODEL_DIR.glob(f"{model_name}_q10_*.pkl"))
+            upper_paths = sorted(MODEL_DIR.glob(f"{model_name}_q90_*.pkl"))
+            if not lower_paths or not upper_paths:
+                return None, None
+            lower_path, upper_path = lower_paths[-1], upper_paths[-1]
+        else:
+            lower_path = MODEL_DIR / f"{model_name}_q10_{version}.pkl"
+            upper_path = MODEL_DIR / f"{model_name}_q90_{version}.pkl"
+        with open(lower_path, "rb") as f:
+            q10 = pickle.load(f)
+        with open(upper_path, "rb") as f:
+            q90 = pickle.load(f)
+        return q10, q90
+    except FileNotFoundError:
+        return None, None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -391,6 +514,12 @@ def run_training(
     run_shap: bool = True,
     save: bool = True,
     log_to_db: bool = True,
+    compute_thresholds: bool = True,
+    numeric_features: Optional[List[str]] = None,
+    bool_features: Optional[List[str]] = None,
+    categorical_features: Optional[List[str]] = None,
+    target: Optional[str] = None,
+    train_quantiles: bool = False,
 ) -> Dict:
     """
     Full training pipeline. Returns metrics dict.
@@ -400,28 +529,75 @@ def run_training(
         run_shap:   Whether to compute SHAP (requires shap package).
         save:       Save model artifact to MODEL_DIR.
         log_to_db:  Write model run metrics to model_runs table.
+        compute_thresholds: Compute + write low_performer_thresholds.json.
+            MUST be False for ml/train_coldstart_*.py — that file is read by
+            ml/predict.py for production low-performer flagging of established
+            stations, and a cold-start model's thresholds would silently
+            corrupt it.
+        numeric_features/bool_features/categorical_features/target: override
+            this module's defaults — used by ml/train_coldstart_*.py to train
+            on a different (history-free) feature set / target column via
+            this same pipeline.
+        train_quantiles: also fit p10/p90 siblings on the same X_train/y_train
+            (see train_quantile_pair()) and return them as _q10_model/_q90_model
+            in-memory handles. False by default (preserves existing behavior);
+            ml/train_coldstart_*.py passes True and saves them itself via
+            save_quantile_models() (this function never saves them — same
+            save=False convention as _model/_feature_names/_categories).
     """
     if not _HAS_LGB:
         raise ImportError("lightgbm is required. Run: pip install lightgbm")
 
+    target = target if target is not None else TARGET
+
     if df is None:
         from ev_pipeline.db.db_manager import get_feature_matrix
         log.info("Loading feature matrix from DB...")
-        df = get_feature_matrix(min_months=3)
+        df = get_feature_matrix(min_months=3, min_months_since_opening=3)
 
-    if df.empty or TARGET not in df.columns:
+    if df.empty or target not in df.columns:
         raise ValueError("Feature matrix is empty or missing target column.")
 
-    df = df.dropna(subset=[TARGET]).copy()
+    df = df.dropna(subset=[target]).copy()
+
+    # next_month_kwh (or any kWh target) is a physical energy quantity —
+    # never legitimately negative. A negative value here means the
+    # underlying monthly_bills row was a billing correction/credit note, not
+    # real consumption, and would make log1p(target) return NaN (its domain
+    # is x > -1), crashing everything downstream. Drop those rows rather
+    # than silently NaN-ing.
+    n_negative = int((df[target] < 0).sum())
+    if n_negative:
+        log.warning(
+            "Dropping %d row(s) with negative %s (likely a billing correction, not real consumption)",
+            n_negative, target,
+        )
+        df = df[df[target] >= 0].copy()
+
     log.info("Training on %d rows from %d stations",
              len(df), df["unique_scno"].nunique())
 
     # ── Prepare ───────────────────────────────────────────────────────────────
-    X, y, feature_names = prepare_features(df)
+    X, y, feature_names = prepare_features(
+        df, numeric_features=numeric_features, bool_features=bool_features,
+        categorical_features=categorical_features, target=target,
+    )
+    # Lock in the category vocabulary from the FULL dataset now, and reuse it
+    # for every subsequent prepare_features() call (train split, test split,
+    # and later inference) — otherwise each call re-infers categories from
+    # whatever rows it's given, and LightGBM rejects any mismatch against
+    # what it was actually fit on (see prepare_features() docstring).
+    categories = extract_categories(X)
     train_df, test_df   = time_split(df)
 
-    X_train, y_train, _ = prepare_features(train_df)
-    X_test,  y_test,  _ = prepare_features(test_df)
+    X_train, y_train, _ = prepare_features(
+        train_df, categories=categories, numeric_features=numeric_features,
+        bool_features=bool_features, categorical_features=categorical_features, target=target,
+    )
+    X_test,  y_test,  _ = prepare_features(
+        test_df, categories=categories, numeric_features=numeric_features,
+        bool_features=bool_features, categorical_features=categorical_features, target=target,
+    )
 
     # Align columns (test may be missing some categories seen only in train)
     X_test = X_test.reindex(columns=X_train.columns)
@@ -438,6 +614,11 @@ def run_training(
     log.info("Test results: MAE=%.1f  RMSE=%.1f  MAPE=%.1f%%",
              test_metrics["test_mae"], test_metrics["test_rmse"], test_metrics["test_mape"])
 
+    # ── Quantile siblings (prediction intervals) ────────────────────────────
+    q10_model = q90_model = None
+    if train_quantiles:
+        q10_model, q90_model = train_quantile_pair(X_train, y_train)
+
     # ── SHAP ──────────────────────────────────────────────────────────────────
     shap_importance = None
     if run_shap and _HAS_SHAP:
@@ -445,16 +626,17 @@ def run_training(
         shap_importance = compute_shap(model, X_train, output_path=shap_path)
 
     # ── Low performer thresholds ──────────────────────────────────────────────
-    thresholds = compute_low_performer_thresholds(df)
-    thresh_path = MODEL_DIR / "low_performer_thresholds.json"
-    with open(thresh_path, "w") as f:
-        json.dump(thresholds, f, indent=2)
-    log.info("Low performer thresholds saved to %s", thresh_path)
+    if compute_thresholds:
+        thresholds = compute_low_performer_thresholds(df, target=target)
+        thresh_path = MODEL_DIR / "low_performer_thresholds.json"
+        with open(thresh_path, "w") as f:
+            json.dump(thresholds, f, indent=2)
+        log.info("Low performer thresholds saved to %s", thresh_path)
 
     # ── Version + save ────────────────────────────────────────────────────────
     version = datetime.utcnow().strftime("%Y%m%d_%H%M")
     if save:
-        save_model(model, feature_names, version)
+        save_model(model, feature_names, version, categories=categories)
 
     # ── Log to DB ─────────────────────────────────────────────────────────────
     all_metrics = {
@@ -476,6 +658,9 @@ def run_training(
         # only reads specific named keys, so these are safely ignored there.
         "_model": model,
         "_feature_names": feature_names,
+        "_categories": categories,
+        "_q10_model": q10_model,
+        "_q90_model": q90_model,
     }
     if log_to_db:
         try:

@@ -1,0 +1,8 @@
+Uptime estimation - how many chargers - example 30kW charger - 30*24*30 = total possible output
+But used some KWH - So uptime estimated by that
+
+
+Also for training and testing, skip a few stations 
+    Predict the station performance from scratch
+    Compare data from the prediction to actual data time series
+

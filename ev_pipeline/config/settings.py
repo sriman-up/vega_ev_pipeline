@@ -6,6 +6,21 @@ Central configuration. Override via environment variables or a .env file.
 import os
 from pathlib import Path
 
+# Every constant below is computed once, the first time this module is
+# imported anywhere — and that computation is cached for the life of the
+# process. If .env hasn't been loaded yet at that moment (e.g. some other
+# module imports ev_pipeline.* before an entry point's own load_dotenv()
+# call runs), DB_URL etc. get permanently baked in with placeholder defaults,
+# and calling load_dotenv() later does nothing to fix it. Loading it here —
+# the first thing this module does — makes that bug structurally impossible
+# regardless of which script imports what, in what order. Safe to also call
+# load_dotenv() again in entry points; it's idempotent.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # ── Google Places API ─────────────────────────────────────────────────────────
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "YOUR_KEY_HERE")
 PLACES_NEARBY_RADIUS_M = 1000  # 1 km radius for competition search

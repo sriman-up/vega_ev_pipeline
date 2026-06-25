@@ -232,62 +232,114 @@ def parse_consumer_details(pdf_path: str) -> Dict[str, Any]:
 # Billing History — single-row layout
 # ─────────────────────────────────────────────────────────────────────────────
 
-_MONTH_RE = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/\d{2,4}$", re.I)
+# Matches a single-row history line extracted as plain text, e.g.:
+#   "Apr/2026 01 13321 229 2497.00 3090.00 5587.00 0.00 0.00"
+# Groups: month, status, kwh_reading, kwh_units, demand, je_debit,
+#         collection, je_credit, arrears.
+# Not anchored at line start (matched via re.search): some PDF exports
+# (ConsumptionReportHistory.jsp) don't expose this layout via
+# extract_table() at all — extract_table() returns 0 rows even though the
+# text is clean — so this is parsed line-by-line off extract_text() like
+# the dual-row layout, which also tolerates any sidebar-nav text bleed.
+_SINGLE_TEXT_LINE_RE = re.compile(
+    r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/\d{2,4})"
+    r"\s+(\d+)"                     # status
+    r"\s+(-?[\d.]+)"                # kwh closing reading
+    r"\s+(-?[\d.]+)"                # kwh units
+    r"\s+(-?[\d.]+)"                # demand (Rs.)
+    r"\s+(-?[\d.]+)"                # JE debit (Rs.)
+    r"\s+(-?[\d.]+)"                # collection (Rs.)
+    r"\s+(-?[\d.]+)"                # JE credit (Rs.)
+    r"\s+(-?[\d.]+)\s*$",           # arrears (Rs.)
+    re.I,
+)
 
 # Matches the IR (first) line of a dual-row entry extracted as plain text, e.g.:
 #   "Apr/2026 01 / IR 9 39665 2905 17876.00 0.00 17876.00 0.00 0.00 0"
 # Groups: month, status, cat, kwh_reading, kwh_units, demand, je_debit,
 #         collection, je_credit, arrears, fixed_charges
-# This mirrors the column layout that extract_table() returns so the same
-# parsing loop can consume both table rows and text-fallback rows.
+# Arrears (and in principle any Rs. column) can be negative (credit balance),
+# e.g. "-764.00" — every numeric group allows an optional leading '-'.
+# No leading "^" anchor: the live portal's PDF export (ConsumptionLinkDetails/
+# ConsumptionReportHistory.jsp) bleeds sidebar nav text ("Meeting Particulars",
+# "Spot Billing Information", ...) onto the same extracted line as a data row
+# whenever their y-coordinates happen to line up, so this is matched with
+# re.search() rather than re.match().
 _IR_TEXT_LINE_RE = re.compile(
-    r"^((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/\d{2,4})"
-    r"\s+(\d+(?:\s*/\s*\w+)?)"   # status: "01 / IR" or "00"
-    r"\s+(\d+)"                    # category
-    r"\s+([\d.]+)"                 # kwh closing reading
-    r"\s+([\d.]+)"                 # kwh units
-    r"\s+([\d.]+)"                 # demand (Rs.)
-    r"\s+([\d.]+)"                 # JE debit (Rs.)
-    r"\s+([\d.]+)"                 # collection (Rs.)
-    r"\s+([\d.]+)"                 # JE credit (Rs.)
-    r"\s+([\d.]+)"                 # arrears (Rs.)
-    r"\s+([\d.]+)",                # fixed charges
+    r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/\d{2,4})"
+    r"\s+(\d+(?:\s*/\s*\w+)?)"      # status: "01 / IR" or "00"
+    r"\s+(\d+)"                     # category
+    r"\s+(-?[\d.]+)"                # kwh closing reading
+    r"\s+(-?[\d.]+)"                # kwh units
+    r"\s+(-?[\d.]+)"                # demand (Rs.)
+    r"\s+(-?[\d.]+)"                # JE debit (Rs.)
+    r"\s+(-?[\d.]+)"                # collection (Rs.)
+    r"\s+(-?[\d.]+)"                # JE credit (Rs.)
+    r"\s+(-?[\d.]+)"                # arrears (Rs.)
+    r"\s+(-?[\d.]+)\s*$",           # fixed charges
     re.I,
 )
+
+# Matches the 9N/LT (second) line of a dual-row entry, e.g.:
+#   "0.00 9N LT 18 0 0.00 0.00 54.00 54.00 1.00"
+# PF is sometimes omitted entirely (closing/zero-activity months), and the
+# trailing bill date — when not split across PDF lines by cell wrapping — can
+# appear inline as a single "DD-Mon-YY" token.
+_LT_TEXT_LINE_RE = re.compile(
+    r"(-?[\d.]+)"                        # cmd_kva
+    r"\s+(\w+)"                           # lc
+    r"\s+(\w+)"                           # side
+    r"\s+(-?[\d.]+)"                      # kvah closing reading
+    r"\s+(-?[\d.]+)"                      # kvah units
+    r"\s+(-?[\d.]+)"                      # billed units
+    r"\s+(-?[\d.]+)"                      # rmd_kva
+    r"\s+(-?[\d.]+)"                      # comp load
+    r"\s+(-?[\d.]+)"                      # bill MD
+    r"(?:\s+(-?[\d.]+))?"                 # power factor (optional)
+    r"(?:\s+(\d{1,2}-[A-Za-z]{3}-?\d{0,4}))?"  # inline bill date (optional)
+    r"\s*$",
+    re.I,
+)
+
+# A table cell that wraps ("DD-Mon-" + "YY" on separate lines) splits the
+# bill date across two text lines straddling the LT line: the "DD-Mon-"
+# fragment appears on the line *before* the LT data, and the bare "YY"/"YYYY"
+# remainder appears on the line *after* it.
+_DATE_PREFIX_RE = re.compile(r"^(\d{1,2}-[A-Za-z]{3})-\s*$", re.I)
+_YEAR_SUFFIX_RE = re.compile(r"^(\d{2,4})\s*$")
 
 
 def parse_billing_history_single(pdf_path: str, unique_scno: str) -> List[Dict[str, Any]]:
     """Parse standard single-row-per-month history PDF (Swathi layout)."""
-    rows: List[Dict[str, Any]] = []
+    all_text_lines: List[str] = []
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            table = page.extract_table()
-            if not table:
-                continue
-            for row in table:
-                if not row or not row[0]:
-                    continue
-                cell0 = str(row[0]).strip()
-                if not _MONTH_RE.match(cell0):
-                    continue
-                try:
-                    rec: Dict[str, Any] = {
-                        "unique_scno":         unique_scno,
-                        "bill_month":          _bill_month_to_iso(cell0),
-                        "status":              _clean(row[1]) if len(row) > 1 else None,
-                        "kwh_closing_reading": _to_float(row[2]) if len(row) > 2 else None,
-                        "kwh_units":           _to_float(row[3]) if len(row) > 3 else None,
-                        "demand_rs":           _to_float(row[4]) if len(row) > 4 else None,
-                        "je_debit_rs":         _to_float(row[5]) if len(row) > 5 else None,
-                        "collection_rs":       _to_float(row[6]) if len(row) > 6 else None,
-                        "je_credit_rs":        _to_float(row[7]) if len(row) > 7 else None,
-                        "arrears_rs":          _to_float(row[8]) if len(row) > 8 else None,
-                        "source":              "pdf_import",
-                    }
-                    if rec["bill_month"]:
-                        rows.append({k: v for k, v in rec.items() if v is not None})
-                except Exception as e:
-                    log.warning("Skipping row %s: %s", row, e)
+            all_text_lines.extend(
+                ln.strip()
+                for ln in (page.extract_text() or "").splitlines()
+                if ln.strip()
+            )
+
+    rows: List[Dict[str, Any]] = []
+    for ln in all_text_lines:
+        m = _SINGLE_TEXT_LINE_RE.search(ln)
+        if not m:
+            continue
+        rec: Dict[str, Any] = {
+            "unique_scno":         unique_scno,
+            "bill_month":          _bill_month_to_iso(m.group(1)),
+            "status":              m.group(2),
+            "kwh_closing_reading": _to_float(m.group(3)),
+            "kwh_units":           _to_float(m.group(4)),
+            "demand_rs":           _to_float(m.group(5)),
+            "je_debit_rs":         _to_float(m.group(6)),
+            "collection_rs":       _to_float(m.group(7)),
+            "je_credit_rs":        _to_float(m.group(8)),
+            "arrears_rs":          _to_float(m.group(9)),
+            "source":              "pdf_import",
+        }
+        if rec["bill_month"]:
+            rows.append({k: v for k, v in rec.items() if v is not None})
     log.info("Parsed %d single-row history records for SCNo %s", len(rows), unique_scno)
     return rows
 
@@ -297,122 +349,111 @@ def parse_billing_history_single(pdf_path: str, unique_scno: str) -> List[Dict[s
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_billing_history_dual(pdf_path: str, unique_scno: str) -> List[Dict[str, Any]]:
-    """Parse dual-row-per-month history PDF (Tata EV / HV layout)."""
-    rows: List[Dict[str, Any]] = []
-    all_table_rows: List[List] = []
-    all_text_lines: List[str] = []
+    """
+    Parse dual-row-per-month history PDF (Tata EV / HV layout).
 
+    pdfplumber's extract_table() is unreliable across page breaks for this
+    layout: continuation pages can come back with phantom leading columns,
+    which makes every row's first cell None and silently drops the whole
+    page. Plain text extraction doesn't have that problem, so this parses
+    line-by-line off extract_text() instead and reconstructs IR/LT pairs
+    from the sequence of recognized line types — anything that isn't an
+    IR line, LT line, or bill-date fragment (sidebar/header/footer noise)
+    is simply skipped.
+    """
+    all_text_lines: List[str] = []
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            table = page.extract_table()
-            if table:
-                all_table_rows.extend(table)
-            # Always collect text too — needed to supplement pages where
-            # extract_table() returns rows that don't carry the month cell
-            # (e.g., mid-table page continuations in web-to-PDF documents).
             all_text_lines.extend(
                 ln.strip()
                 for ln in (page.extract_text() or "").splitlines()
                 if ln.strip()
             )
 
-    # Determine which bill_months the table pass already captured so we
-    # don't create duplicates when the text pass finds the same data.
-    table_months: set = set()
-    for row in all_table_rows:
-        if row and row[0]:
-            tm = re.match(
-                r"^((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/\d{2,4})",
-                str(row[0]).strip(), re.I,
-            )
-            if tm:
-                iso = _bill_month_to_iso(tm.group(1))
-                if iso:
-                    table_months.add(iso)
+    # Classify each line into a typed event; unrecognized lines (nav menu,
+    # page headers/footers, table column headers) are dropped.
+    events: List[Tuple[str, Any]] = []
+    for ln in all_text_lines:
+        m = _IR_TEXT_LINE_RE.search(ln)
+        if m:
+            events.append(("IR", m))
+            continue
+        m = _LT_TEXT_LINE_RE.search(ln)
+        if m:
+            events.append(("LT", m))
+            continue
+        m = _DATE_PREFIX_RE.match(ln)
+        if m:
+            events.append(("DATE_PREFIX", m.group(1)))
+            continue
+        m = _YEAR_SUFFIX_RE.match(ln)
+        if m:
+            events.append(("YEAR", m.group(1)))
 
-    # Text-based supplement: add rows for any months the table pass missed.
-    j = 0
-    while j < len(all_text_lines):
-        tm = _IR_TEXT_LINE_RE.match(all_text_lines[j])
-        if tm:
-            iso = _bill_month_to_iso(tm.group(1))
-            if iso not in table_months:
-                ir_row = list(tm.groups())
-                lt_row = all_text_lines[j + 1].split() if j + 1 < len(all_text_lines) else []
-                all_table_rows.append(ir_row)
-                all_table_rows.append(lt_row)
-                if iso:
-                    table_months.add(iso)
-            j += 2
-        else:
-            j += 1
+    rows: List[Dict[str, Any]] = []
+    pending_ir: Optional[re.Match] = None
+    date_prefix: Optional[str] = None
 
     i = 0
-    while i < len(all_table_rows):
-        row = all_table_rows[i]
-        if not row or not row[0]:
-            i += 1
-            continue
-        cell0 = str(row[0]).strip()
-        m = re.match(r"^((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/\d{2,4})", cell0, re.I)
-        if not m:
-            i += 1
-            continue
-
-        month_str = m.group(1)
-        ir_row = row
-        lt_row = all_table_rows[i + 1] if i + 1 < len(all_table_rows) else []
-
-        def g(r, idx, fn=_to_float):
-            try:
-                return fn(r[idx]) if len(r) > idx and r[idx] else None
-            except Exception:
-                return None
-
-        status_raw = str(ir_row[1]).strip() if len(ir_row) > 1 else ""
-        status_m = re.match(r"(\d+)\s*/\s*(\w+)", status_raw)
-        status = status_m.group(1) if status_m else None
-        cat_ab = status_m.group(2) if status_m else None
-
-        bill_date_raw = str(lt_row[-1]).strip() if lt_row else None
-        bill_date = None
-        if bill_date_raw:
-            bd_m = re.match(r"(\d{2})-([A-Za-z]{3})-?(\d{2,4})", bill_date_raw)
-            if bd_m:
-                bill_date = _parse_date(f"{bd_m.group(1)}-{bd_m.group(2).upper()}-{bd_m.group(3)}")
-
-        rec: Dict[str, Any] = {
-            "unique_scno":          unique_scno,
-            "bill_month":           _bill_month_to_iso(month_str),
-            "status":               status,
-            "category_ab":          cat_ab,
-            "kwh_closing_reading":  g(ir_row, 3),
-            "kwh_units":            g(ir_row, 4),
-            "demand_rs":            g(ir_row, 5),
-            "je_debit_rs":          g(ir_row, 6),
-            "collection_rs":        g(ir_row, 7),
-            "je_credit_rs":         g(ir_row, 8),
-            "arrears_rs":           g(ir_row, 9),
-            "fixed_charges_rs":     g(ir_row, 10),
-            "cmd_kva":              g(lt_row, 0),
-            "lc_side":              str(lt_row[2]).strip() if len(lt_row) > 2 else None,
-            "kvah_closing_reading": g(lt_row, 3),
-            "kvah_units":           g(lt_row, 4),
-            "billed_units":         g(lt_row, 5),
-            "rmd_kva":              g(lt_row, 6),
-            "comp_load":            g(lt_row, 7),
-            "bill_md":              g(lt_row, 8),
-            "power_factor":         g(lt_row, 9),
-            "bill_date":            bill_date,
-            "source":               "pdf_import",
-        }
-
-        if rec["bill_month"]:
-            rows.append({k: v for k, v in rec.items() if v is not None})
-        i += 2
+    while i < len(events):
+        etype, edata = events[i]
+        if etype == "IR":
+            pending_ir = edata
+            date_prefix = None
+        elif etype == "DATE_PREFIX":
+            date_prefix = edata
+        elif etype == "LT":
+            inline_date = edata.group(11)
+            bill_date = _parse_date(inline_date) if inline_date else None
+            if bill_date is None and date_prefix:
+                if i + 1 < len(events) and events[i + 1][0] == "YEAR":
+                    bill_date = _parse_date(f"{date_prefix}-{events[i + 1][1]}")
+                    i += 1  # consume the year fragment
+            if pending_ir is not None:
+                rows.append(_build_dual_row(unique_scno, pending_ir, edata, bill_date))
+                pending_ir = None
+            date_prefix = None
+        # "YEAR" events not directly following an LT line are stray noise.
+        i += 1
 
     log.info("Parsed %d dual-row history records for SCNo %s", len(rows), unique_scno)
     return rows
+
+
+def _build_dual_row(
+    unique_scno: str, ir: "re.Match", lt: "re.Match", bill_date: Optional[str],
+) -> Dict[str, Any]:
+    status_raw = ir.group(2).strip()
+    status_m = re.match(r"(\d+)\s*/\s*(\w+)", status_raw)
+    status = status_m.group(1) if status_m else status_raw or None
+    cat_ab = status_m.group(2) if status_m else None
+
+    rec: Dict[str, Any] = {
+        "unique_scno":          unique_scno,
+        "bill_month":           _bill_month_to_iso(ir.group(1)),
+        "status":               status,
+        "category_ab":          cat_ab,
+        "kwh_closing_reading":  _to_float(ir.group(4)),
+        "kwh_units":            _to_float(ir.group(5)),
+        "demand_rs":            _to_float(ir.group(6)),
+        "je_debit_rs":          _to_float(ir.group(7)),
+        "collection_rs":        _to_float(ir.group(8)),
+        "je_credit_rs":         _to_float(ir.group(9)),
+        "arrears_rs":           _to_float(ir.group(10)),
+        "fixed_charges_rs":     _to_float(ir.group(11)),
+        "cmd_kva":              _to_float(lt.group(1)),
+        "lc_side":              lt.group(3),
+        "kvah_closing_reading": _to_float(lt.group(4)),
+        "kvah_units":           _to_float(lt.group(5)),
+        "billed_units":         _to_float(lt.group(6)),
+        "rmd_kva":              _to_float(lt.group(7)),
+        "comp_load":            _to_float(lt.group(8)),
+        "bill_md":              _to_float(lt.group(9)),
+        "power_factor":         _to_float(lt.group(10)),
+        "bill_date":            bill_date,
+        "source":               "pdf_import",
+    }
+    return {k: v for k, v in rec.items() if v is not None}
 
 
 def parse_billing_history(pdf_path: str, unique_scno: str, dual_row: bool = False) -> List[Dict[str, Any]]:

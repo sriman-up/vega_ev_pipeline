@@ -4,6 +4,12 @@ EV Station Performance Prediction Pipeline — Orchestrator
 
 Modes:
   --mode seed       Parse PDFs and seed DB (one-time)
+  --mode refresh-bills
+                    Re-parse history PDFs (recursively under --pdf_dir) into
+                    monthly_bills only, for stations already in the DB — no
+                    Places/geo/tariff calls, no station-table writes, no new
+                    stations. Use after a pdf_parser.py fix to re-import bill
+                    history, e.g. --pdf_dir TS_LT_data
   --mode monthly    Scrape latest bills + rebuild features (run monthly)
   --mode enrich     Re-run Places API enrichment for all stations
   --mode features   Recompute all features without scraping
@@ -41,6 +47,7 @@ from ev_pipeline.db.db_manager import (
     close_pool,
     get_all_stations,
     get_monthly_weather,
+    get_station,
     get_station_billing_history,
     refresh_all_station_bill_summaries,
     upsert_monthly_bill,
@@ -160,6 +167,78 @@ def seed_from_pdfs(pdf_dir: str):
         _build_station_features(scno, station_data)
 
     log.info("Seed complete.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REFRESH-BILLS — re-parse history PDFs into monthly_bills only, for stations
+# that already exist in the DB. No Places/geo/tariff calls, no station-table
+# writes, no new stations created — use --mode seed for that. Use this after
+# a pdf_parser.py bug fix to re-import bill history without redoing the rest
+# of seed (and without re-spending Places API quota).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def refresh_bills_from_pdfs(pdf_dir: str):
+    """
+    Recursively walk pdf_dir for history PDFs (filename contains "hist",
+    case-insensitive) and re-parse each with auto_parse_history(). Existing
+    bill months not covered by a given PDF (e.g. a more recent month from
+    the live monthly scraper) are left in place — only their rolling
+    features are recomputed alongside the freshly parsed months.
+    """
+    hist_pdfs = sorted(p for p in Path(pdf_dir).rglob("*.pdf") if "hist" in p.name.lower())
+    log.info("Found %d history PDFs under %s", len(hist_pdfs), pdf_dir)
+
+    processed = skipped = failed = 0
+    for hp in hist_pdfs:
+        scno = hp.stem.split("-")[0]
+        if not scno.isdigit():
+            log.warning("Cannot derive SCNo from filename %s, skipping", hp.name)
+            skipped += 1
+            continue
+
+        station = get_station(scno)
+        if not station:
+            log.warning("SCNo %s (from %s) not found in DB, skipping", scno, hp.name)
+            skipped += 1
+            continue
+
+        try:
+            pdf_bills = auto_parse_history(str(hp), scno)
+        except Exception as e:
+            log.error("Failed to parse %s: %s", hp.name, e)
+            failed += 1
+            continue
+
+        if not pdf_bills:
+            log.warning("No bill rows parsed from %s, skipping", hp.name)
+            skipped += 1
+            continue
+
+        pdf_months = {b["bill_month"] for b in pdf_bills}
+        extra = [
+            {
+                "unique_scno": scno,
+                "bill_month": str(r["bill_month"]),
+                "kwh_units": r.get("kwh_units"),
+                "billed_units": r.get("billed_units"),
+            }
+            for r in get_station_billing_history(scno)
+            if str(r["bill_month"]) not in pdf_months
+        ]
+
+        combined = backfill_rolling_features(pdf_bills + extra)
+        for bill in combined:
+            bill["station_id"] = station["id"]
+            upsert_monthly_bill(bill)
+
+        log.info("Refreshed %d bill rows for SCNo %s (%s)", len(combined), scno, hp.name)
+        processed += 1
+
+    refresh_all_station_bill_summaries()
+    log.info(
+        "Bill refresh complete: %d stations updated, %d skipped, %d failed",
+        processed, skipped, failed,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -394,7 +473,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="EV Station Pipeline")
     parser.add_argument(
         "--mode",
-        choices=["seed", "monthly", "enrich", "features", "spatial", "backfill", "backfill-features"],
+        choices=["seed", "refresh-bills", "monthly", "enrich", "features", "spatial", "backfill", "backfill-features"],
         required=True,
     )
     parser.add_argument("--pdf_dir", default="./pdfs/")
@@ -411,6 +490,8 @@ if __name__ == "__main__":
     try:
         if args.mode == "seed":
             seed_from_pdfs(args.pdf_dir)
+        elif args.mode == "refresh-bills":
+            refresh_bills_from_pdfs(args.pdf_dir)
         elif args.mode == "monthly":
             monthly_update()
         elif args.mode == "enrich":
